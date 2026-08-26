@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from app.config import WORKSPACE
+from app.config import get_workspace
 
 
 def _resolve_safe(path: str) -> "Path":
     """Resolve *path* and ensure it stays inside the workspace."""
     from pathlib import Path
 
-    target = (WORKSPACE / path).resolve()
-    if not str(target).startswith(str(WORKSPACE)):
+    ws = get_workspace()
+    target = (ws / path).resolve()
+    if not str(target).startswith(str(ws)):
         raise PermissionError(f"Path escapes workspace: {path}")
     return target
 

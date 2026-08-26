@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vektorcode"
@@ -12,6 +12,7 @@ license = {text = "MIT"}
 dependencies = [
     "openai>=1.0.0",
     "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -23,4 +24,4 @@ dev = [
 vektorcode = "app.main:main"
 
 [tool.setuptools.packages.find]
-include = ["app*"]
+include = ["app", "app.*"]

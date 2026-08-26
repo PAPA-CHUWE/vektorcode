@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 from app.commands.env_utils import mask_key, read_env, reload_env, write_env
+from app.config import get_auth_provider
 
 
 def cmd_auth(args: list[str]) -> str:
-    """Show or set the API key."""
-    env = read_env()
-    current = env.get("LITELLM_API_KEY", "")
+    """Show, set, or clear the API key via the auth provider."""
+    provider = get_auth_provider()
 
     if not args:
-        return f"API Key: {mask_key(current)}" if current else "API Key: (not set)"
+        if provider.is_authenticated():
+            creds = provider.get_credentials()
+            masked = mask_key(creds.api_key)
+            return f"Provider: {provider.name}\n  API Key: {masked}"
+        return f"Provider: {provider.name}\n  Status: not authenticated"
 
     if args[0] == "clear":
+        provider.logout()
+        # Also clear from .env
+        env = read_env()
         env.pop("LITELLM_API_KEY", None)
         write_env(env)
-        reload_env(env)
         return "API Key cleared."
 
+    # Set new key
+    provider.login(api_key=args[0])
+    # Also persist to .env
+    env = read_env()
     env["LITELLM_API_KEY"] = args[0]
     write_env(env)
-    reload_env(env)
     return f"API Key set to: {mask_key(args[0])}"
 
 

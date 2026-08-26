@@ -35,9 +35,9 @@ def show_tool_line(action: str, path: str, style: str = "file.path") -> None:
 
 def show_error_panel(title: str, detail: str = "") -> None:
     """Render a red error panel."""
-    header = Text(title, style="error bold")
-    body = Text(detail, style="error") if detail else Text("")
-    console.print(Panel(body, title=header, border_style="error", width=60))
+    header = Text(title, style="bold #c82828")
+    body = Text(detail, style="#c82828") if detail else Text("")
+    console.print(Panel(body, title=header, border_style="#c82828", width=60))
 
 
 def show_change_panel(path: str, old: str, new: str) -> None:

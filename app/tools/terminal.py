@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import subprocess
 
-from app.config import WORKSPACE
+from app.config import get_workspace
 
 DESTRUCTIVE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\brm\s+(-[a-zA-Z]*r|-[a-zA-Z]*f|-[a-zA-Z]*rf)"),
@@ -42,8 +42,9 @@ def run_command(
     Blocks destructive commands unless confirm=True.
     """
     try:
-        cwd = (WORKSPACE / working_directory).resolve()
-        if not str(cwd).startswith(str(WORKSPACE)):
+        ws = get_workspace()
+        cwd = (ws / working_directory).resolve()
+        if not str(cwd).startswith(str(ws)):
             return "Error: working directory escapes workspace"
         if not cwd.exists():
             return f"Error: working directory does not exist: {working_directory}"

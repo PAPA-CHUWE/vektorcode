@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 
-from app.config import WORKSPACE
+from app.config import get_workspace
 
 
 def search_code(
@@ -18,8 +18,9 @@ def search_code(
     Returns matching lines with file paths and line numbers.
     """
     try:
-        target = (WORKSPACE / path).resolve()
-        if not str(target).startswith(str(WORKSPACE)):
+        ws = get_workspace()
+        target = (ws / path).resolve()
+        if not str(target).startswith(str(ws)):
             return "Error: path escapes workspace"
         if not target.exists():
             return f"Error: path does not exist: {path}"
