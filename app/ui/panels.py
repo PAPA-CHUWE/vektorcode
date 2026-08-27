@@ -198,13 +198,38 @@ def show_confirmation(detail: str, kind: str = "destructive") -> bool:
     title, caution = _CONFIRM_TITLES.get(kind, _CONFIRM_TITLES["destructive"])
     console.print()
     show_error_panel(title, detail)
-    console.print(f"  {caution}\n", style="warning")
+    console.print(f"  {caution}", style="warning")
+
+    # Rich buffers through prompt_toolkit's stdout proxy while input() writes
+    # straight to the terminal, so without this flush the question can appear
+    # after output it precedes. Force the panel out before asking.
     try:
-        answer = input("  Continue? [y/N] ").strip().lower()
+        console.file.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    # The question names the action and target: if the panel scrolls away,
+    # "Continue?" alone gives no clue what is being approved.
+    subject = _one_line_detail(detail)
+    question = f"  ▸ Allow {kind} {subject}? [y/N] "
+    try:
+        answer = input(question).strip().lower()
     except (EOFError, KeyboardInterrupt):
         console.print("\n  Aborted.", style="dim")
         return False
-    return answer in {"y", "yes"}
+
+    approved = answer in {"y", "yes"}
+    console.print(
+        "  ✓ approved" if approved else "  ✗ declined",
+        style="success" if approved else "error",
+    )
+    return approved
+
+
+def _one_line_detail(detail: str, width: int = 52) -> str:
+    """Collapse the action detail to a single readable fragment."""
+    flat = " ".join(detail.split())
+    return flat if len(flat) <= width else "…" + flat[-(width - 1):]
 
 
 def show_final_summary(

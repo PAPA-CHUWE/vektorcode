@@ -25,6 +25,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.config import get_model
+
 
 # ── Token Estimation ────────────────────────────────────────────────
 
@@ -92,7 +94,7 @@ def get_model_config(model_name: str | None = None) -> ModelConfig:
        silently assigned them the 32K default, forcing needless compaction.
     4. Safe 32K default
     """
-    name = model_name or os.getenv("LITELLM_MODEL", "qwen")
+    name = model_name or get_model()
 
     exact = _MODEL_CONFIGS.get(name)
     if exact is not None:

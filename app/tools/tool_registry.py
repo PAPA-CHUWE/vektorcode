@@ -170,6 +170,7 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
     from app.tools.search import search_code
     from app.tools.terminal import run_command
     from app.tools.config import get_config
+    from app.tools.git import handler as git_handler
 
     registry.register(
         name="list_files",
@@ -281,6 +282,51 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
     )
 
     registry.register(
+        name="git_tool",
+        description="Run git operations: status, diff, log, add, commit, branch, push, pull, merge",
+        category="git",
+        handler=git_handler,
+        parameters={
+            "type": "object",
+            "properties": {
+                "subcommand": {
+                    "type": "string",
+                    "description": "One of: status, diff, log, add, commit, branch, push, pull, merge",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path scoped to workspace, for diff/add",
+                    "default": ".",
+                },
+                "staged": {
+                    "type": "boolean",
+                    "description": "For diff: show staged changes",
+                    "default": False,
+                },
+                "max_count": {
+                    "type": "integer",
+                    "description": "For log: limit number of commits shown",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Commit message (required for commit)",
+                },
+                "branch_name": {
+                    "type": "string",
+                    "description": "Branch name (for branch/merge)",
+                },
+                "switch_only": {
+                    "type": "boolean",
+                    "description": "For branch: switch to existing branch instead of creating a new one",
+                    "default": False,
+                },
+            },
+            "required": ["subcommand"],
+        },
+        required_permissions=["git"],
+    )
+
+    registry.register(
         name="get_config",
         description="Show current configuration",
         category="config",
@@ -291,3 +337,42 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
         },
         required_permissions=["config"],
     )
+
+
+def format_tools_for_prompt(registry: "ToolRegistry") -> str:
+    """Render every enabled tool as a numbered prompt line.
+
+    The system prompt is the model's only source of truth about what tools
+    exist — this project uses textual <tool_call> blocks, not the OpenAI
+    `tools=` parameter. Hand-maintaining that list meant registering a tool
+    updated the registry (and the status bar) while the model went on
+    believing the old set. Generating it here keeps the two in step.
+
+    Uses the `description` and `parameters` already supplied at registration,
+    so there is no second place to keep current.
+    """
+    lines = ["Available tools:", ""]
+    for index, tool in enumerate(registry.list_available(), start=1):
+        schema = tool.parameters or {}
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
+
+        parts: list[str] = []
+        for name, spec in properties.items():
+            is_string = spec.get("type") == "string"
+            if name in required:
+                example = '"..."' if is_string else "..."
+            else:
+                default = spec.get("default")
+                if default is None:
+                    example = '""' if is_string else "..."
+                elif isinstance(default, str):
+                    example = f'"{default}"'
+                elif isinstance(default, bool):
+                    example = "true" if default else "false"
+                else:
+                    example = str(default)
+            parts.append(f"{name}={example}")
+
+        lines.append(f"{index}. {tool.name}({', '.join(parts)}) → {tool.description}")
+    return "\n".join(lines)

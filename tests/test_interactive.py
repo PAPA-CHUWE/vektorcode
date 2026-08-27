@@ -339,6 +339,142 @@ def test_confirmation_reaches_the_worker_thread():
     check(results == [True], "the human's answer reached the tool")
 
 
+def test_cursor_signals_ready_busy_ready_reset():
+    """The whole point: idle and working must be distinguishable."""
+    import app.ui.cursor as cursor
+    from app.ui.cursor import SHAPES
+
+    names = {
+        SHAPES["blinking-block"]: "ready",
+        SHAPES["block"]: "busy",
+        "\x1b[0 q": "reset",
+    }
+    seen: list[str] = []
+
+    def step(self, message):
+        yield AgentEvent(type="tool_start", tool="list_files", target=".", data={})
+        time.sleep(0.3)
+        yield AgentEvent(type="tool_result", tool="list_files", target=".", message="a", data={})
+        yield AgentEvent(type="agent_message", message="done")
+
+    with patch.object(cursor, "_write", lambda code: seen.append(names.get(code, code))):
+        _drive([("go\r", 1.5), ("exit\r", 0.2)], step)
+
+    collapsed = [c for i, c in enumerate(seen) if i == 0 or c != seen[i - 1]]
+    check("busy" in collapsed, f"cursor goes busy during a turn (saw {collapsed})")
+    check("busy" in collapsed and "ready" in collapsed[collapsed.index("busy") + 1:],
+          "cursor returns to ready once the turn finishes")
+    check(collapsed and collapsed[-1] == "reset", "cursor is reset on exit")
+
+
+def test_write_diff_uses_captured_args_not_tool_result_payload():
+    """tool_result carries no arguments, so the diff must use the stash.
+
+    Reading them from event.data made every write render "(no changes)".
+    """
+    import app.main as _main
+    from app.agent import AgentEvent
+    from app.ui.console import console as ui_console
+    from app.ui.toolfeed import ToolFeed
+
+    target = C.WORKSPACE / "workspace" / "_diff_probe.py"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text('def greet():\n    return "hello"\n')
+    new_text = 'def greet(name):\n    return f"hi {name}"\n'
+
+    try:
+        _main.reset_turn()
+        feed = ToolFeed()
+        _main.render_event(AgentEvent(
+            type="tool_start", tool="write_file", target=str(target),
+            data={"path": "workspace/_diff_probe.py", "content": new_text}), feed)
+        target.write_text(new_text)
+        with ui_console.capture() as cap:
+            # Exactly what the agent emits: no arguments here.
+            _main.render_event(AgentEvent(
+                type="tool_result", tool="write_file", target="workspace/_diff_probe.py",
+                message="Wrote 40 bytes",
+                data={"error": False, "blocked": False}), feed)
+        out = cap.get()
+    finally:
+        if target.exists():
+            target.unlink()
+        _main.reset_turn()
+
+    check("no changes" not in out, "a real write does not render as '(no changes)'")
+    check('return "hello"' in out and 'f"hi {name}"' in out,
+          "both sides of the diff are rendered")
+
+
+def test_confirmation_precedes_the_write():
+    """The safety property: approval is asked before the file changes."""
+    from app.tools import get_registry
+
+    target = C.WORKSPACE / "workspace" / "_order_probe.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("ORIGINAL")
+    seen = {}
+
+    def approver(kind, detail):
+        seen["when_asked"] = target.read_text()
+        return True
+
+    set_mode(PermissionMode.DEFAULT)
+    set_approver(approver)
+    try:
+        get_registry().execute(
+            "write_file",
+            {"path": "workspace/_order_probe.txt", "content": "REPLACED"},
+        )
+        check(seen.get("when_asked") == "ORIGINAL",
+              "the file is untouched at the moment approval is requested")
+        check(target.read_text() == "REPLACED", "the approved write then lands")
+    finally:
+        set_approver(None)
+        set_mode(PermissionMode.DEFAULT)
+        if target.exists():
+            target.unlink()
+
+
+def test_confirmation_question_names_the_action():
+    """A bare 'Continue?' is meaningless once the panel scrolls away."""
+    from app.ui.panels import show_confirmation
+
+    asked = {}
+
+    def fake_input(question):
+        asked["q"] = question
+        return "y"
+
+    with patch("builtins.input", fake_input):
+        approved = show_confirmation("app/skills/notes.md (961 bytes)", "write")
+
+    check(approved is True, "an approved action returns True")
+    check("write" in asked["q"] and "notes.md" in asked["q"],
+          f"the question names the action and target (got {asked['q']!r})")
+
+    with patch("builtins.input", lambda q: "n"):
+        check(show_confirmation("rm -rf build/", "destructive") is False,
+              "a declined action returns False")
+
+
+def test_retry_reruns_the_previous_prompt():
+    """/retry was not a command at all — it went to the model as literal text."""
+    seen = []
+
+    def step(self, message):
+        seen.append(message)
+        yield AgentEvent(type="agent_message", message="ok")
+
+    _drive([("find the parser\r", 0.4), ("/retry\r", 0.5), ("exit\r", 0.2)], step)
+    check(seen == ["find the parser", "find the parser"],
+          f"/retry re-ran the previous prompt (got {seen})")
+
+    seen.clear()
+    _drive([("/retry\r", 0.4), ("exit\r", 0.2)], step)
+    check(seen == [], "/retry with no history runs nothing")
+
+
 # ── Status surfaces ─────────────────────────────────────────────────
 
 def test_status_bar_shows_mode():

@@ -35,6 +35,7 @@ from prompt_toolkit.styles import Style
 from app.permissions.mode import cycle_mode, get_mode
 from app.ui.runstate import run_state
 from app.ui.completer import VektorCompleter
+from app.ui.cursor import set_cursor_ready
 
 # ── Paste Detection Thresholds ──────────────────────────────────────
 
@@ -322,6 +323,7 @@ class VektorInput:
         """
         session = self._get_session()
         self._pastes.clear()
+        set_cursor_ready()
         try:
             raw = session.prompt(
                 prompt_fragments(self._workspace),
@@ -339,6 +341,7 @@ class VektorInput:
         """
         session = self._get_session()
         self._pastes.clear()
+        set_cursor_ready()
         try:
             raw = await session.prompt_async(
                 prompt_fragments(self._workspace),

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.config import get_workspace
+from .categories import PermissionCategory
 
 logger = logging.getLogger(__name__)
 
@@ -36,19 +37,6 @@ class PermissionLevel(enum.Enum):
     BROWSER = "browser"       # Browser automation
     INTERACTIVE = "interactive"   # Desktop computer use
     FULL = "full"         # All capabilities
-
-
-class PermissionCategory(enum.Enum):
-    """Categories of permissions for fine-grained control."""
-    FILESYSTEM = "filesystem"     # File read/write
-    SHELL = "shell"           # Shell commands
-    SEARCH = "search"     # Code search
-    CONFIG = "config"     # Config inspection
-    BROWSER = "browser"   # Browser automation
-    COMPUTER = "computer"   # Desktop interaction
-    SCREENSHOT = "screenshot"   # Screenshot capture
-    NETWORK = "network"     # Network access
-    DESTRUCTIVE = "destructive"   # Destructive operations
 
 
 @dataclass
@@ -73,6 +61,7 @@ class PermissionPolicy:
         "screenshot": False,
         "network": False,
         "destructive": False,
+        "git": False,
     })
 
     # Browser policy

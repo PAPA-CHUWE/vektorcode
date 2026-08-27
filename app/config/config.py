@@ -105,8 +105,14 @@ def load_env(force: bool = False) -> None:
                 os.environ[key] = value
 
 
+# Single source of truth for the fallback model. Previously config.py said
+# "gemma" while context.py said "qwen", so with LITELLM_MODEL unset the app
+# would call one model and size its context budget for another.
+DEFAULT_MODEL = "nemotron-3-super"
+
+
 def get_model() -> str:
-    return os.getenv("LITELLM_MODEL", "gemma")
+    return os.getenv("LITELLM_MODEL", DEFAULT_MODEL)
 
 
 def get_endpoint() -> str:

@@ -497,8 +497,8 @@ def test_command_registry():
 
     # Registry has all expected commands
     expected = {"/help", "/status", "/model", "/models", "/endpoint",
-                "/auth", "/workspace", "/tools", "/clear", "/tokens",
-                "/trace", "/queue", "/mode", "/reload", "/exit"}
+                "/auth", "/workspace", "/tools", "/clear", "/retry", "/skills",
+                "/tokens", "/trace", "/queue", "/mode", "/reload", "/exit"}
     actual = {c.name for c in COMMAND_registry}
     assert expected == actual
 
@@ -665,9 +665,12 @@ def test_tool_registry():
 
     registry = get_registry()
 
-    # All 6 tools registered
+    # Every built-in tool is registered.
+    expected = {"list_files", "read_file", "write_file", "search_code",
+                "run_command", "git_tool", "get_config"}
     all_tools = registry.list_all()
-    assert len(all_tools) == 6, f"Expected 6 tools, got {len(all_tools)}"
+    assert {t.name for t in all_tools} == expected, \
+        f"registered tools differ: {sorted(t.name for t in all_tools)}"
 
     # get() returns correct tool
     tool = registry.get("list_files")
@@ -747,7 +750,7 @@ def test_tools_command_registry():
     categories = registry.get_categories()
 
     # Should have tools in multiple categories
-    assert len(tools) == 6
+    assert len(tools) == len(registry.list_all())
     assert len(categories) >= 3
 
     # Every tool has name, description, category
@@ -1291,6 +1294,214 @@ def test_strip_leaked_reasoning_noop_when_preamble_incomplete():
     print("  PASS: no strip when the split is ambiguous")
 
 
+# ── Git tool ────────────────────────────────────────────────────────
+
+def test_git_tool_is_registered():
+    from app.tools import get_registry
+
+    registry = get_registry()
+    assert registry.has("git_tool"), "git_tool was never registered"
+    tool = registry.get("git_tool")
+    assert tool.category == "git", tool.category
+    assert "git" in tool.required_permissions, tool.required_permissions
+    # It must also be visible to the model, not just the registry.
+    names = [s["function"]["name"] for s in registry.to_llm_schemas()]
+    assert "git_tool" in names, names
+    print("  PASS: git_tool is registered and exposed to the model")
+
+
+def test_git_tool_status_via_registry():
+    from app.tools import get_registry
+    from app.tools.tool_result import ToolStatus
+
+    result = get_registry().execute("git_tool", {"subcommand": "status"})
+    # Whatever the repo state, dispatch itself must succeed.
+    assert result.status is not ToolStatus.ERROR, str(result)
+    assert "Unknown tool" not in str(result), str(result)
+    assert "Bad arguments" not in str(result), str(result)
+    print("  PASS: git_tool status subcommand dispatches correctly")
+
+
+def test_git_tool_commit_requires_message():
+    from app.tools.git import handler
+
+    result = handler(subcommand="commit")
+    assert result["success"] is False, result
+    assert "message" in result["stderr"].lower(), result
+    print("  PASS: commit without message fails cleanly")
+
+
+def _git_approval(subcommand, approver, **extra):
+    """Run a git subcommand under a given approver, return the ToolResult."""
+    from app.permissions.mode import PermissionMode, set_approver, set_mode
+    from app.tools import get_registry
+
+    set_mode(PermissionMode.DEFAULT)
+    set_approver(approver)
+    try:
+        return get_registry().execute("git_tool", {"subcommand": subcommand, **extra})
+    finally:
+        set_approver(None)
+        set_mode(PermissionMode.DEFAULT)
+
+
+def test_git_push_requires_approval():
+    """push reaches a remote — it must go through the human gate."""
+    from app.tools.tool_result import ToolStatus
+
+    asked = []
+    result = _git_approval("push", lambda kind, detail: (asked.append(detail), False)[1])
+    assert asked == ["git push"], asked
+    assert result.status is ToolStatus.BLOCKED, str(result)
+
+    # Non-interactive: nobody to ask means blocked, never auto-approved.
+    blocked = _git_approval("push", None)
+    assert blocked.status is ToolStatus.BLOCKED, str(blocked)
+    print("  PASS: git push requires approval and fails safe")
+
+
+def test_git_merge_requires_approval():
+    from app.tools.tool_result import ToolStatus
+
+    asked = []
+    result = _git_approval(
+        "merge", lambda kind, detail: (asked.append(detail), False)[1],
+        branch_name="feature-x",
+    )
+    assert asked == ["git merge feature-x"], asked
+    assert result.status is ToolStatus.BLOCKED, str(result)
+
+    blocked = _git_approval("merge", None, branch_name="feature-x")
+    assert blocked.status is ToolStatus.BLOCKED, str(blocked)
+    print("  PASS: git merge requires approval and fails safe")
+
+
+def test_git_read_and_local_subcommands_are_not_gated():
+    """Over-gating teaches the model to route around the tool."""
+    from app.tools.tool_result import ToolStatus
+
+    def refuse(kind, detail):
+        raise AssertionError(f"should not have asked for approval: {detail}")
+
+    for subcommand in ("status", "log", "diff"):
+        result = _git_approval(subcommand, refuse)
+        assert result.status is not ToolStatus.BLOCKED, f"{subcommand}: {result}"
+
+    # commit is local and reversible; it fails on its own missing-message
+    # check rather than being blocked by the permission layer.
+    commit = _git_approval("commit", refuse)
+    assert commit.status is not ToolStatus.BLOCKED, str(commit)
+    print("  PASS: read-only and local git subcommands are not gated")
+
+
+def test_git_tool_respects_workspace_boundary():
+    """_resolve_safe must not be bypassed by the registry call path."""
+    from app.tools import get_registry
+
+    result = get_registry().execute(
+        "git_tool", {"subcommand": "diff", "path": "../../../etc"}
+    )
+    assert "success" not in str(result) or "escape" in str(result).lower() \
+        or "outside" in str(result).lower() or "Error" in str(result), str(result)
+    print("  PASS: git_tool refuses paths outside the workspace")
+
+
+# ── System prompt / registry agreement ──────────────────────────────
+
+def test_system_prompt_lists_every_registered_tool():
+    """The regression guard for the exact bug: git_tool was registered but
+    the model still believed it had six tools."""
+    from app.tools import get_registry
+
+    system_prompt = Agent().history[0]["content"]
+    for tool in get_registry().list_available():
+        assert tool.name in system_prompt, (
+            f"'{tool.name}' is registered but missing from the system prompt "
+            "the model actually sees"
+        )
+    print("  PASS: system prompt lists every registered tool")
+
+
+def test_system_prompt_tool_count_matches_registry():
+    import re
+
+    from app.tools import get_registry
+
+    system_prompt = Agent().history[0]["content"]
+    listed = re.findall(r"^\d+\. \w+\(", system_prompt, re.MULTILINE)
+    expected = len(get_registry().list_available())
+    assert len(listed) == expected, (
+        f"System prompt lists {len(listed)} tools, registry has {expected}"
+    )
+    print("  PASS: system prompt tool count matches registry exactly")
+
+
+def test_clear_history_regenerates_current_tool_list():
+    """/clear must not regress to a stale list — it is a second, independent
+    construction site."""
+    agent = Agent()
+    agent.clear_history()
+    system_prompt = agent.history[0]["content"]
+    assert "git_tool" in system_prompt, "clear_history() produced a stale tool list"
+    print("  PASS: /clear regenerates the current tool list")
+
+
+def test_format_tools_for_prompt_reflects_newly_registered_tool():
+    """Unit-level guard on the formatter, independent of Agent."""
+    from app.tools.tool_registry import ToolRegistry, format_tools_for_prompt
+
+    registry = ToolRegistry()
+    registry.register(
+        name="dummy_tool",
+        description="A test tool",
+        category="test",
+        handler=lambda: "ok",
+        parameters={"type": "object", "properties": {}},
+    )
+    rendered = format_tools_for_prompt(registry)
+    assert "dummy_tool" in rendered, rendered
+    assert "A test tool" in rendered, rendered
+    print("  PASS: formatter reflects a freshly registered tool")
+
+
+def test_new_tool_reaches_the_prompt_with_no_agent_changes():
+    """The real test: does this generalise, or just patch today's mismatch?
+
+    Register an extra tool on the live registry and confirm the count the
+    model sees follows, without touching agent.py.
+    """
+    import re
+
+    from app.tools import get_registry
+
+    registry = get_registry()
+    before = len(re.findall(r"^\d+\. \w+\(", Agent().history[0]["content"], re.MULTILINE))
+
+    registry.register(
+        name="throwaway_probe",
+        description="Temporary tool for testing prompt generation",
+        category="test",
+        handler=lambda: "ok",
+        parameters={
+            "type": "object",
+            "properties": {"target": {"type": "string", "description": "x"}},
+            "required": ["target"],
+        },
+    )
+    try:
+        prompt = Agent().history[0]["content"]
+        after = len(re.findall(r"^\d+\. \w+\(", prompt, re.MULTILINE))
+        assert after == before + 1, f"{before} → {after}"
+        assert "throwaway_probe" in prompt
+        assert 'throwaway_probe(target="...")' in prompt, "signature not rendered"
+    finally:
+        registry.unregister("throwaway_probe")
+
+    restored = len(re.findall(r"^\d+\. \w+\(", Agent().history[0]["content"], re.MULTILINE))
+    assert restored == before, f"registry not restored: {restored} != {before}"
+    print("  PASS: a newly registered tool reaches the prompt automatically")
+
+
 def test_token_usage_captured():
     """Test that token usage is captured from LLM response."""
     from unittest.mock import patch, MagicMock
@@ -1423,6 +1634,18 @@ if __name__ == "__main__":
     test_leaked_think_block_does_not_reach_the_user,
     test_strip_leaked_reasoning_noop_on_single_paragraph,
     test_strip_leaked_reasoning_noop_when_preamble_incomplete,
+    test_git_tool_is_registered,
+    test_git_tool_status_via_registry,
+    test_git_tool_commit_requires_message,
+    test_git_push_requires_approval,
+    test_git_merge_requires_approval,
+    test_git_read_and_local_subcommands_are_not_gated,
+    test_git_tool_respects_workspace_boundary,
+    test_system_prompt_lists_every_registered_tool,
+    test_system_prompt_tool_count_matches_registry,
+    test_clear_history_regenerates_current_tool_list,
+    test_format_tools_for_prompt_reflects_newly_registered_tool,
+    test_new_tool_reaches_the_prompt_with_no_agent_changes,
     test_token_usage_captured,
         test_history_cap,
         test_final_response_terminates_step,

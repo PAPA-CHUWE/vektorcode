@@ -383,6 +383,104 @@ def test_unknown_placeholder_is_left_alone():
           "an unmatched placeholder is passed through untouched")
 
 
+# ── Cursor signalling ───────────────────────────────────────────────
+
+def test_cursor_functions_never_raise_on_broken_stdout():
+    from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
+
+    with patch("sys.stdout.isatty", return_value=True), \
+         patch("sys.stdout.write", side_effect=OSError("broken pipe")):
+        set_cursor_ready()
+        set_cursor_busy()
+        reset_cursor()
+    check(True, "cursor functions degrade silently on broken stdout")
+
+    # A stdout replaced by something without isatty (some capture shims).
+    class Bare:
+        pass
+
+    with patch("sys.stdout", Bare()):
+        set_cursor_ready()
+        reset_cursor()
+    check(True, "cursor functions survive a stdout without isatty")
+
+
+def test_cursor_codes_suppressed_when_not_a_tty():
+    """Escape bytes must never land in redirected output."""
+    import io
+    import sys as _sys
+    from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
+
+    buffer = io.StringIO()          # StringIO.isatty() is False
+    real = _sys.stdout
+    _sys.stdout = buffer
+    try:
+        set_cursor_ready()
+        set_cursor_busy()
+        reset_cursor()
+    finally:
+        _sys.stdout = real
+    check(buffer.getvalue() == "",
+          f"no escape codes written to a non-tty (got {buffer.getvalue()!r})")
+
+
+def test_cursor_codes_written_when_a_tty():
+    import io
+    import sys as _sys
+    from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
+
+    class FakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    buffer = FakeTTY()
+    real = _sys.stdout
+    _sys.stdout = buffer
+    try:
+        set_cursor_ready()
+        set_cursor_busy()
+        reset_cursor()
+    finally:
+        _sys.stdout = real
+    written = buffer.getvalue()
+    # ready = blinking block (widest), busy = same block without the blink.
+    check(written == "\x1b[1 q\x1b[2 q\x1b[0 q",
+          f"correct DECSCUSR codes emitted to a tty (got {written!r})")
+
+
+def test_cursor_shape_is_configurable():
+    import io
+    import os as _os
+    import sys as _sys
+    from app.ui.cursor import SHAPES, set_cursor_ready
+
+    class FakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    def emit():
+        buf = FakeTTY()
+        real = _sys.stdout
+        _sys.stdout = buf
+        try:
+            set_cursor_ready()
+        finally:
+            _sys.stdout = real
+        return buf.getvalue()
+
+    before = _os.environ.get("VEKTOR_CURSOR_READY")
+    try:
+        _os.environ["VEKTOR_CURSOR_READY"] = "blinking-underline"
+        check(emit() == SHAPES["blinking-underline"], "env var selects the cursor shape")
+        _os.environ["VEKTOR_CURSOR_READY"] = "not-a-shape"
+        check(emit() == SHAPES["blinking-block"], "an unknown shape falls back to the default")
+    finally:
+        if before is None:
+            _os.environ.pop("VEKTOR_CURSOR_READY", None)
+        else:
+            _os.environ["VEKTOR_CURSOR_READY"] = before
+
+
 # ── Presentation layer ──────────────────────────────────────────────
 def test_tool_feed_records_steps_and_timing():
     from app.ui.toolfeed import ToolFeed

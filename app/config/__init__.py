@@ -1,6 +1,7 @@
 """VektorCode global configuration."""
 
 from app.config.config import (
+    DEFAULT_MODEL,
     __version__,
     get_workspace,
     get_auth_provider,
@@ -15,6 +16,7 @@ from app.config.config import (
 )
 
 __all__ = [
+    "DEFAULT_MODEL",
     "__version__",
     "get_workspace",
     "get_auth_provider",

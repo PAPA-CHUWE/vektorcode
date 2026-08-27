@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 
 from app.config import get_workspace
+from app.permissions.mode import DESTRUCTIVE, request_approval
+from app.tools.tool_result import ToolResult
 
 
 def _resolve_safe(path: str) -> Path:
@@ -118,12 +120,31 @@ def git_tool(
         return {"success": False, "stdout": "", "stderr": str(e), "exit_code": 1}
 
 
+# Subcommands that reach beyond local, reversible state.
+_APPROVAL_REQUIRED = frozenset({"push", "merge"})
+
+
 def handler(**kwargs):
     """Handler for the tool registry."""
     allowed = {
         "subcommand", "path", "staged", "max_count", "message", "branch_name", "switch_only"
     }
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
-    result = git_tool(**filtered)
-    return result
+
+    # push affects a remote; merge combines histories and can conflict. Both
+    # go through the same human-approval gate as destructive shell commands
+    # and file writes — so a non-interactive run blocks them rather than
+    # auto-approving. add/commit are local and trivially reversible, so they
+    # are deliberately not gated: over-gating just teaches the model to route
+    # around the tool.
+    subcommand = filtered.get("subcommand")
+    if subcommand in _APPROVAL_REQUIRED:
+        detail = f"git {subcommand} {filtered.get('branch_name', '')}".strip()
+        if not request_approval(DESTRUCTIVE, detail):
+            return ToolResult.blocked(
+                f"BLOCKED: '{detail}' was not approved. "
+                "A human declined it, or no one was available to ask."
+            )
+
+    return git_tool(**filtered)
 

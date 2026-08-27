@@ -49,6 +49,7 @@ from app.ui.panels import (
     last_traceback,
     token_display_enabled,
 )
+from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
 from app.ui.toolfeed import ToolFeed
 from app.ui.queue import MessageQueue
 from app.ui.input import INTERRUPT
@@ -129,13 +130,14 @@ _PREVIEW_LINES = 24
 # write, which paths changed) have to be carried here.
 _turn: dict[str, Any] = {
     "changed": [], "old": {}, "passed": None, "failed": None,
-    "tools": 0, "gave_up": False,
+    "tools": 0, "gave_up": False, "pending_write": None,
 }
 
 
 def reset_turn() -> None:
     """Clear per-turn render state. Called before each agent turn."""
-    _turn.update(changed=[], old={}, passed=None, failed=None, tools=0, gave_up=False)
+    _turn.update(changed=[], old={}, passed=None, failed=None, tools=0,
+                 gave_up=False, pending_write=None)
 
 
 def _record_test_counts(output: str) -> None:
@@ -164,6 +166,7 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
             "write_file": "Editing",
             "search_code": "Searching",
             "run_command": "Running",
+            "git_tool": "Git",
             "get_config": "Checking config",
         }.get(event.tool, event.tool)
 
@@ -177,14 +180,21 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
             show_tool_line(label, event.target)
 
         if event.tool == "write_file":
-            # Capture the pre-write contents now; once the tool runs they
-            # are gone, and the diff panel needs both sides.
-            path = event.data.get("path", "")
+            # Stash both sides of the diff now. tool_result carries only
+            # {"error", "blocked"} — no arguments — so the path and the new
+            # content have to be captured here or the panel has nothing to
+            # compare and reports "(no changes)" for every write.
+            path = event.data.get("path", "") or event.target
             existing = get_workspace() / path
             try:
-                _turn["old"][path] = existing.read_text(encoding="utf-8")
+                previous = existing.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
-                _turn["old"][path] = ""
+                previous = ""
+            _turn["pending_write"] = {
+                "path": path,
+                "old": previous,
+                "new": event.data.get("content", ""),
+            }
 
     elif t == "tool_result":
         blocked = event.data.get("blocked", False)
@@ -210,13 +220,17 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
             if len(lines) > _PREVIEW_LINES:
                 show_truncated(len(lines) - _PREVIEW_LINES, "lines")
         elif event.tool == "write_file":
-            path = event.data.get("path", "") or event.target
-            new_text = event.data.get("content", "")
-            show_change_panel(path, _turn["old"].get(path, ""), new_text)
+            pending = _turn.get("pending_write") or {}
+            path = pending.get("path") or event.target
+            show_change_panel(path, pending.get("old", ""), pending.get("new", ""))
+            _turn["pending_write"] = None
             if path and path not in _turn["changed"]:
                 _turn["changed"].append(path)
         elif event.tool == "run_command":
             _record_test_counts(event.message)
+
+    elif t == "skills_applied":
+        console.print(f"  ◆ guidance: {event.message}", style="dim")
 
     elif t == "max_iterations_reached":
         # Not a completion: the model ran out of iterations. Rendered inline
@@ -377,6 +391,23 @@ def dispatch_command(
         }
         show_tools_table(grouped, len(registry.list_available()))
         return
+    if cmd_name == "/skills":
+        from app.skills.loader import load_skills, match_skills
+
+        skills = load_skills()
+        if cmd_args:
+            probe = " ".join(cmd_args)
+            matched = match_skills(probe, skills)
+            show_status_table(
+                [(s.name, ", ".join(s.matches(probe))) for s in matched]
+                or [("(none)", f"nothing matches {probe!r}")]
+            )
+            return
+        show_tools_table(
+            {"skills": [(s.name, ", ".join(s.triggers) or "(no triggers)") for s in skills]},
+            len(skills),
+        )
+        return
     if cmd_name == "/tokens":
         enabled = set_token_display(not token_display_enabled())
         state = "shown" if enabled else "hidden"
@@ -445,6 +476,10 @@ async def _execute_turn(agent: Agent, message: str, stop: threading.Event) -> bo
     feed = ToolFeed()
     reset_turn()
     run_state.begin(MAX_ITERATIONS)
+    # The async REPL has no Rich spinner (it would fight prompt_toolkit for
+    # the cursor), so the busy signal is set here at the real turn boundary
+    # rather than inside spinner().
+    set_cursor_busy()
     last_message = ""
     failed = False
 
@@ -516,6 +551,7 @@ async def run_interactive_async() -> None:
 
     turn: asyncio.Task | None = None
     stop = threading.Event()
+    last_prompt: str = ""
     # Agent-mutating commands submitted mid-turn, run once the turn ends.
     deferred: list[tuple[str, list[str]]] = []
 
@@ -560,6 +596,11 @@ async def run_interactive_async() -> None:
                 # ── the running turn finished → promote the queue ────
                 if turn is not None and turn.done():
                     turn = None
+                    # The reader is still awaiting the same prompt_async call,
+                    # so get_input_async() will not run again to restore the
+                    # ready cursor. Without this the cursor stays "busy" while
+                    # we are in fact idle and waiting.
+                    set_cursor_ready()
                     while deferred:
                         name, cmd_args = deferred.pop(0)
                         dispatch_command(name, cmd_args, agent, queue, vektor_input)
@@ -603,6 +644,23 @@ async def run_interactive_async() -> None:
                 if result.paste_info.is_paste:
                     console.print(f"  {result.display_text}", style="dim", markup=False)
 
+                # /retry re-runs the previous prompt. It was previously not a
+                # command at all, so typing it sent the literal word "retry"
+                # to the model, which had no idea what to repeat.
+                if result.is_command and result.text.split()[0].lower() == "/retry":
+                    if not last_prompt:
+                        console.print("\n  Nothing to retry yet.\n", style="dim")
+                        continue
+                    console.print(f"  ▸ retrying: {last_prompt}", style="dim")
+                    if turn is not None:
+                        queue.submit(last_prompt)
+                        run_state.queued = len(queue)
+                        queue.show_queued(last_prompt, len(queue) - 1)
+                    else:
+                        console.print()
+                        turn = start_turn(last_prompt)
+                    continue
+
                 # ── slash commands ──────────────────────────────────
                 if result.is_command:
                     try:
@@ -634,8 +692,13 @@ async def run_interactive_async() -> None:
                     continue
 
                 console.print()
+                last_prompt = result.text
                 turn = start_turn(result.text)
     finally:
+        # Every exit from the REPL passes through here — exit/quit, Ctrl+D,
+        # and exceptions alike — so the terminal never keeps a cursor shape
+        # VektorCode set once the process is gone.
+        reset_cursor()
         reader.cancel()
         if turn is not None:
             stop.set()
@@ -647,6 +710,7 @@ def run_interactive() -> None:
     try:
         asyncio.run(run_interactive_async())
     except KeyboardInterrupt:
+        reset_cursor()
         console.print("\n[dim]Goodbye.[/dim]")
 
 
@@ -674,6 +738,9 @@ def run_direct(prompt: str) -> None:
                 last_message = event.message
             if event.type == "final_answer":
                 s.update(f"[bold green]✓[/] resolved")
+    # One-shot mode uses the same spinner, which sets the busy cursor.
+    # Without this the shell inherits a block cursor after the process exits.
+    reset_cursor()
     console.print()
     tally = feed.summary()
     if tally is not None:

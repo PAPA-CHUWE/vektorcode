@@ -8,6 +8,7 @@ from typing import Iterator
 from rich.status import Status
 
 from app.ui.console import console
+from app.ui.cursor import set_cursor_busy
 
 
 @contextmanager
@@ -18,6 +19,8 @@ def spinner(message: str = "Working...") -> Iterator[Status]:
     for changing the message dynamically.
     """
     status = console.status(f"[bold blue]●[/] {message}", spinner="dots")
+    # Not reset here: the next get_input()/get_input_async() sets it back.
+    set_cursor_busy()
     status.start()
     try:
         yield status

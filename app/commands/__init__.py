@@ -49,6 +49,8 @@ def _build_registry() -> tuple[list[CommandMeta], dict[str, Callable[..., Any]]]
         CommandMeta("/workspace", "Show current workspace path"),
         CommandMeta("/tools",     "Show available tools"),
         CommandMeta("/clear",     "Clear conversation history"),
+        CommandMeta("/retry",     "Re-run your previous message"),
+        CommandMeta("/skills",    "List guidance skills (or test which match a phrase)"),
         CommandMeta("/tokens",    "Toggle token counts in the status bar"),
         CommandMeta("/queue",     "List queued messages (clear | pop)"),
         CommandMeta("/mode",      "Show or set permission mode (shift+tab cycles)"),

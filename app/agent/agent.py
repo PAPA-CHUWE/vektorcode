@@ -25,8 +25,10 @@ from typing import Any, Iterator
 from app.config import get_model, get_workspace
 from app.context import ContextManager
 from app.cost import BudgetTracker, TaskLogger, estimate_cost
+from app.skills.loader import load_skills, match_skills, render_skills
 from app.llm import chat
 from app.tools import get_registry, get_event_bus
+from app.tools.tool_registry import format_tools_for_prompt
 from app.tools.events import ToolEvent, ToolEventType
 from app.tools.tool_result import ToolStatus
 
@@ -67,14 +69,7 @@ You have access to tools for:
 - searching code across the workspace
 - checking your own configuration
 
-Available tools:
-
-1. list_files(path=".") → list files/dirs at path
-2. read_file(path="file.txt") → read file contents
-3. write_file(path="file.txt", content="...") → write content to file
-4. search_code(pattern="regex", path=".", include="*.py") → search file contents (like grep)
-5. run_command(command="ls -la", working_directory=".") → run shell command
-6. get_config() → show current model, endpoint, API key status
+{tools_section}
 
 To use a tool, output EXACTLY this format (one call per block):
 
@@ -114,6 +109,7 @@ TOOL_LABELS: dict[str, str] = {
     "write_file": "Editing",
     "search_code": "Searching",
     "run_command": "Running",
+    "git_tool": "Git",
     "get_config": "Checking config",
 }
 
@@ -412,6 +408,25 @@ def _is_abandoned_turn(text: str) -> bool:
     return stripped.lower().startswith(_DELIBERATION_OPENERS)
 
 
+_SKILLS_CACHE: list | None = None
+
+
+def _skills() -> list:
+    """All parsed skills, loaded once per process."""
+    global _SKILLS_CACHE
+    if _SKILLS_CACHE is None:
+        _SKILLS_CACHE = load_skills()
+    return _SKILLS_CACHE
+
+
+def _build_system_prompt() -> str:
+    """Build the system prompt with a tool list generated from the registry."""
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        workspace=str(get_workspace()),
+        tools_section=format_tools_for_prompt(get_registry()),
+    )
+
+
 def _safe_int(value: Any) -> int:
     """Coerce a token-usage field to int, defaulting to 0.
 
@@ -455,7 +470,7 @@ class Agent:
     """
 
     def __init__(self) -> None:
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(workspace=str(get_workspace()))
+        system_prompt = _build_system_prompt()
         self.history: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
@@ -471,7 +486,7 @@ class Agent:
 
     def clear_history(self) -> None:
         """Reset conversation to just the system prompt."""
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(workspace=str(get_workspace()))
+        system_prompt = _build_system_prompt()
         self.history = [{"role": "system", "content": system_prompt}]
 
     def _cap_history(self) -> None:
@@ -550,6 +565,10 @@ class Agent:
             return target
         if name == "run_command":
             return args.get("command", "")
+        if name == "git_tool":
+            sub = args.get("subcommand", "")
+            extra = args.get("branch_name") or args.get("path", "")
+            return f"{sub} {extra}".strip() if extra not in ("", ".") else sub
         if name == "get_config":
             return ""
         return ""
@@ -585,6 +604,27 @@ class Agent:
         4. Repeat until LLM produces a final response (no tool calls)
         """
         self.history.append({"role": "user", "content": user_message})
+
+        # ── Inject any skills this request triggers ─────────────────
+        # Only matched skills go in: all 16 bodies total ~13KB, which would
+        # be half the context budget on a 27.6k model. Already-injected
+        # skills are skipped so a long conversation cannot accumulate them.
+        already = {
+            m.get("skill") for m in self.history if m.get("role") == "system"
+        }
+        matched = [s for s in match_skills(user_message, _skills()) if s.name not in already]
+        for skill in matched:
+            self.history.append({
+                "role": "system",
+                "content": render_skills([skill]),
+                "skill": skill.name,
+            })
+        if matched:
+            yield AgentEvent(
+                type="skills_applied",
+                message=", ".join(s.name for s in matched),
+                data={"skills": [s.name for s in matched]},
+            )
 
         # Pre-flight context check
         status = self.context_manager.get_status(self.history)
