@@ -2,6 +2,49 @@
 
 AI coding agent that connects to an OpenAI-compatible LLM endpoint to inspect, modify, execute, test, and debug software projects.
 
+## Install
+
+**pipx** is the recommended path. VektorCode runs alongside whatever project
+you point it at, so isolating its dependencies avoids conflicts with the
+environment it is working in.
+
+```bash
+pipx install vektorcode
+```
+
+Without pipx:
+
+```bash
+pip install --user vektorcode
+```
+
+Before it is on PyPI, install straight from the repository:
+
+```bash
+pipx install git+https://github.com/PAPA-CHUWE/vektorcode
+```
+
+Requires **Python 3.10+**. `git` must be on PATH for the git tool; every
+other tool works without it.
+
+## Configure
+
+VektorCode reads `LITELLM_BASE_URL`, `LITELLM_API_KEY` and `LITELLM_MODEL`
+from the environment or from a `.env` file. It looks in
+`~/.config/vektorcode/.env` first, then the workspace.
+
+```bash
+mkdir -p ~/.config/vektorcode
+cat > ~/.config/vektorcode/.env <<'ENV'
+LITELLM_BASE_URL=http://your-endpoint:30080
+LITELLM_API_KEY=your-key
+LITELLM_MODEL=nemotron-3-super
+ENV
+```
+
+Then run `vektorcode` in any project directory, or `vektorcode "a prompt"`
+for a single turn.
+
 ## Project Structure
 
 ```

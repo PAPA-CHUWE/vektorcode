@@ -17,7 +17,7 @@ from rich.text import Text
 from app.agent import Agent, AgentEvent
 from app.agent.agent import MAX_ITERATIONS
 from app.commands import COMMAND_registry, COMMANDS
-from app.config import get_workspace, __version__, load_env
+from app.config import get_endpoint, get_model, get_workspace, __version__, load_env
 from app.tools import get_registry
 from app.ui import (
     console,
@@ -246,9 +246,16 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
             show_markdown(event.message)
 
     elif t == "error":
-        show_error("Agent Error", event.message.strip().splitlines()[0]
-                   if event.message.strip() else "unknown error",
-                   event.message)
+        # A short multi-line error is guidance, not a stack trace — show all
+        # of it. Hiding the "here is how to configure it" line behind /trace
+        # is exactly backwards on a first run.
+        lines = [l for l in event.message.strip().splitlines() if l.strip()]
+        summary = lines[0] if lines else "unknown error"
+        rest = "\n".join(lines[1:])
+        if rest and len(rest) <= 240:
+            show_error("Agent Error", summary, "", hint=rest)
+        else:
+            show_error("Agent Error", summary, event.message)
 
     elif t == "context_status":
         status = event.data.get("status", "OK")
@@ -375,7 +382,7 @@ def dispatch_command(
     if cmd_name == "/status":
         ctx = agent.context_manager.get_status(agent.history)
         show_status_table([
-            ("Model", os.getenv("LITELLM_MODEL", "(not set)")),
+            ("Model", get_model()),
             ("Workspace", str(get_workspace())),
             ("History", f"{len(agent.history)} messages"),
             ("Tools", str(_tool_count())),
@@ -510,7 +517,7 @@ async def _execute_turn(agent: Agent, message: str, stop: threading.Event) -> bo
 def _footer(agent: Agent, status: str = "ready") -> None:
     show_context_bar(
         workspace=get_workspace().name,
-        model=os.getenv("LITELLM_MODEL", ""),
+        model=get_model(),
         tool_count=_tool_count(),
         input_tokens=agent.input_tokens,
         output_tokens=agent.output_tokens,
@@ -530,7 +537,7 @@ async def run_interactive_async() -> None:
     message starts automatically — no extra keypress.
     """
     vektor_input = VektorInput(workspace=get_workspace())
-    show_banner(model=os.getenv("LITELLM_MODEL", ""), workspace=str(get_workspace()))
+    show_banner(model=get_model(), workspace=str(get_workspace()))
 
     agent = Agent()
     queue = MessageQueue()
@@ -719,7 +726,7 @@ def run_interactive() -> None:
 
 def run_direct(prompt: str) -> None:
     """Execute a single prompt and exit."""
-    model = os.getenv("LITELLM_MODEL", "")
+    model = get_model()
     console.print(f"[dim]Workspace: {get_workspace()}[/dim]")
     console.print(f"[dim]Model: {model}[/dim]\n")
 
@@ -756,7 +763,7 @@ def main() -> None:
 
     if args.reload:
         load_env(force=True)
-        model = os.getenv("LITELLM_MODEL", "(not set)")
+        model = get_model()
         endpoint = os.getenv("LITELLM_BASE_URL", "(not set)")
         status_line(f"Model: {model}")
         status_line(f"Endpoint: {endpoint}")

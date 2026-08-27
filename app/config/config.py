@@ -11,7 +11,30 @@ from pathlib import Path
 
 from app.auth import APIKeyAuthProvider, AuthProvider
 
-__version__ = "0.1.0"
+def _read_version() -> str:
+    """Version from installed package metadata, so pyproject.toml is the
+    single source of truth and a hardcoded copy cannot drift from it."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover - Python < 3.8
+        return "0.0.0+unknown"
+    try:
+        return version("vektorcode")
+    except PackageNotFoundError:
+        # Running from a source checkout that was never installed.
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            return "0.0.0+source"
+        candidate = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        try:
+            with open(candidate, "rb") as handle:
+                return tomllib.load(handle)["project"]["version"]
+        except (OSError, KeyError, ValueError):
+            return "0.0.0+source"
+
+
+__version__ = _read_version()
 
 # The directory this package lives in (installed or editable).
 PACKAGE_DIR = Path(__file__).resolve().parent.parent

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -55,6 +56,14 @@ def git_tool(
         ws = get_workspace()
         if not ws.exists():
             return {"success": False, "stdout": "", "stderr": "Workspace does not exist", "exit_code": 1}
+
+        if shutil.which("git") is None:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": "git is not installed or not on PATH.",
+                "exit_code": 127,
+            }
 
         repo = find_repo_root(ws)
         if repo is None:
@@ -181,5 +190,11 @@ def handler(**kwargs):
                 "A human declined it, or no one was available to ask."
             )
 
-    return git_tool(**filtered)
+    result = git_tool(**filtered)
+    if isinstance(result, dict) and not result.get("success", True):
+        # Without this the registry wraps the dict in ToolResult.success()
+        # and a failed git command renders as a green tick.
+        detail = (result.get("stderr") or result.get("stdout") or "git command failed").strip()
+        return ToolResult.make_error(detail, data=result)
+    return result
 

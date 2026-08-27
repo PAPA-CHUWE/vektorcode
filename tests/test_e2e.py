@@ -1323,12 +1323,23 @@ def test_git_tool_status_via_registry():
 
 
 def test_git_tool_commit_requires_message():
+    """A failed git operation must surface as an error, not a green tick.
+
+    The handler returns a plain dict on success but a ToolResult on failure,
+    because the registry wraps bare dicts in ToolResult.success() — which
+    reported failed git commands as successful tool calls.
+    """
     from app.tools.git import handler
+    from app.tools.tool_result import ToolResult, ToolStatus
 
     result = handler(subcommand="commit")
-    assert result["success"] is False, result
-    assert "message" in result["stderr"].lower(), result
-    print("  PASS: commit without message fails cleanly")
+    assert isinstance(result, ToolResult), f"expected ToolResult, got {type(result)}"
+    assert result.status is ToolStatus.ERROR, result.status
+    assert "message" in str(result).lower(), str(result)
+
+    # The underlying payload is still attached for callers that want it.
+    assert result.data["success"] is False, result.data
+    print("  PASS: commit without message fails cleanly, as an error")
 
 
 def _git_approval(subcommand, approver, **extra):

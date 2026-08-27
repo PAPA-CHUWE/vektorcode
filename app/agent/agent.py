@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from app.config import get_model, get_workspace
+from app.config import get_endpoint, get_model, get_workspace
 from app.context import ContextManager
 from app.cost import BudgetTracker, TaskLogger, estimate_cost
 from app.agent.stall import StallDetector
@@ -743,7 +743,13 @@ class Agent:
             try:
                 response = chat(safe_messages)
             except Exception as exc:
-                msg = f"Error: could not reach LLM — {exc}"
+                # A fresh install has no .env, so this is the first thing a
+                # new user hits. "Connection error" alone tells them nothing.
+                msg = (
+                    f"Error: could not reach the LLM at {get_endpoint()} — {exc}\n"
+                    "Set LITELLM_BASE_URL, LITELLM_API_KEY and LITELLM_MODEL in "
+                    "~/.config/vektorcode/.env (or your shell), then run /reload."
+                )
                 self.history.append({"role": "assistant", "content": msg})
                 self._log_cycle(iteration, final=True)
                 task_logger.errors.append(msg)
