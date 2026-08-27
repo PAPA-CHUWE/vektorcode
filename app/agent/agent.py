@@ -54,6 +54,21 @@ BEHAVIOR RULES — FOLLOW THESE EXACTLY:
 - Start working immediately. No preamble, no "Sure!", no "I'd be happy to help". Just do the work.
 - When done, give a concise result. One or two sentences max for simple tasks.
 
+ACT — DO NOT EXPLAIN HOW THE USER COULD DO IT:
+- You are operating on a REAL workspace with REAL tools. If a request can be
+  carried out with your tools, carry it out. Do not describe the steps the
+  user could take themselves.
+- Never answer a "do X" request with a tutorial, a numbered how-to, or an
+  example workflow using placeholder names. The user asked you to change
+  their project, not to teach them.
+- Never end with "let me know if you'd like help applying this", "give it a
+  try", or "if you want, I can...". You are the one applying it. Apply it.
+- If you are asked whether you are done: you are done only if you actually
+  changed something or answered the specific question. Explaining is not
+  doing, and a summary of what could be done is not a result.
+- The one exception: if the user explicitly asks how something works, or for
+  an explanation, then explain.
+
 INVESTIGATION STYLE:
 - Investigate efficiently, then finish the task. Take as many tool calls as the
   task genuinely needs — there is no fixed budget, and you must not stop early
@@ -280,6 +295,43 @@ def _extract_balanced_json(text: str) -> str | None:
                 return text[start:i + 1]
 
     return None
+
+
+# Hermes/Qwen-style calls: <function=name><parameter=key>value
+# nemotron-3-nano emits these instead of JSON, so without this its calls are
+# invisible and every turn looks like an empty response.
+_FUNCTION_RE = re.compile(r"<function\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>", re.IGNORECASE)
+_PARAMETER_RE = re.compile(
+    r"<parameter\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*>\s*(.*?)\s*(?=<parameter\s*=|</parameter>|</function>|<function\s*=|</tool_call>|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _coerce_scalar(raw: str) -> Any:
+    """Turn an XML parameter's text into the type the schema expects."""
+    text = raw.strip().strip('"').strip("'")
+    lowered = text.lower()
+    if lowered in ("true", "false"):
+        return lowered == "true"
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    return text
+
+
+def _extract_xml_calls(text: str) -> list[dict[str, Any]]:
+    """Parse <function=name><parameter=key>value tool calls."""
+    calls: list[dict[str, Any]] = []
+    matches = list(_FUNCTION_RE.finditer(text))
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[start:end]
+        arguments = {
+            key: _coerce_scalar(value)
+            for key, value in _PARAMETER_RE.findall(body)
+        }
+        calls.append({"name": match.group(1), "arguments": arguments})
+    return calls
 
 
 def _extract_bare_json(text: str) -> dict[str, Any] | None:
@@ -541,7 +593,12 @@ class Agent:
         if calls:
             return calls
 
-        # Format 2: bare JSON
+        # Format 2: <function=name><parameter=key>value
+        xml_calls = _extract_xml_calls(text)
+        if xml_calls:
+            return xml_calls
+
+        # Format 3: bare JSON
         bare = _extract_bare_json(text)
         if bare:
             return [bare]

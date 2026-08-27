@@ -1408,6 +1408,17 @@ def test_git_tool_respects_workspace_boundary():
 
 # ── System prompt / registry agreement ──────────────────────────────
 
+def test_system_prompt_forbids_tutorialising():
+    """VektorCode answered a 'do this' request with a git tutorial ending in
+    'let me know if you'd like help applying this to a specific repository',
+    despite having git_tool. The prompt must rule that out explicitly."""
+    system_prompt = Agent().history[0]["content"].lower()
+    for phrase in ["real workspace", "tutorial", "let me know if you'd like help",
+                   "explaining is not"]:
+        assert phrase in system_prompt, f"missing guidance: {phrase!r}"
+    print("  PASS: system prompt forbids tutorialising instead of acting")
+
+
 def test_system_prompt_lists_every_registered_tool():
     """The regression guard for the exact bug: git_tool was registered but
     the model still believed it had six tools."""
@@ -1641,6 +1652,7 @@ if __name__ == "__main__":
     test_git_merge_requires_approval,
     test_git_read_and_local_subcommands_are_not_gated,
     test_git_tool_respects_workspace_boundary,
+    test_system_prompt_forbids_tutorialising,
     test_system_prompt_lists_every_registered_tool,
     test_system_prompt_tool_count_matches_registry,
     test_clear_history_regenerates_current_tool_list,

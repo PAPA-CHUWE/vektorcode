@@ -383,6 +383,36 @@ def test_unknown_placeholder_is_left_alone():
           "an unmatched placeholder is passed through untouched")
 
 
+def test_xml_style_tool_calls_are_parsed():
+    """nemotron-3-nano emits <function=…><parameter=…> instead of JSON.
+
+    Unparsed, its calls were invisible and every turn looked empty.
+    """
+    agent = Agent.__new__(Agent)
+
+    hermes = "<tool_call> <function=git_tool> <parameter=subcommand> log\n<parameter=max_count> 3"
+    check(agent._extract_tool_calls(hermes) ==
+          [{"name": "git_tool", "arguments": {"subcommand": "log", "max_count": 3}}],
+          "loose Hermes-style call parses, with int coercion")
+
+    closed = "<function=read_file>\n<parameter=path>app/main.py</parameter>\n</function>"
+    check(agent._extract_tool_calls(closed) ==
+          [{"name": "read_file", "arguments": {"path": "app/main.py"}}],
+          "fully closed XML form parses")
+
+    booleans = "<function=run_command><parameter=command>pytest -q</parameter>" \
+               "<parameter=dry>true</parameter></function>"
+    parsed = agent._extract_tool_calls(booleans)[0]
+    check(parsed["arguments"]["dry"] is True, "booleans coerce from text")
+    check(parsed["arguments"]["command"] == "pytest -q", "spaces inside values survive")
+
+    check(agent._extract_tool_calls("just a normal answer") == [],
+          "plain prose still yields no tool call")
+    check(agent._extract_tool_calls('<tool_call>{"name":"list_files","arguments":{"path":"."}}</tool_call>') ==
+          [{"name": "list_files", "arguments": {"path": "."}}],
+          "JSON form still takes precedence")
+
+
 # ── Stall detection ─────────────────────────────────────────────────
 
 def _run_stall(request, calls):
