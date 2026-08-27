@@ -10,6 +10,28 @@ from app.permissions.mode import DESTRUCTIVE, request_approval
 from app.tools.tool_result import ToolResult
 
 
+def find_repo_root(start: Path) -> Path | None:
+    """Locate the git repository governing (or contained in) a directory.
+
+    Searches the directory itself, then its ancestors, then one level of
+    subdirectories. The last step matters: launching from a parent folder
+    that merely *contains* the project left every git command reporting
+    "not a git repository", and the agent then advised running git init on
+    a repo that already existed one level down.
+    """
+    start = start.resolve()
+    for candidate in [start, *start.parents]:
+        if (candidate / ".git").exists():
+            return candidate
+    try:
+        children = sorted(c for c in start.iterdir() if c.is_dir())
+    except OSError:
+        return None
+    nested = [c for c in children if (c / ".git").exists()]
+    # Only when it is unambiguous — two candidate repos means we must not guess.
+    return nested[0] if len(nested) == 1 else None
+
+
 def _resolve_safe(path: str) -> Path:
     """Resolve *path* and ensure it stays inside the workspace."""
     ws = get_workspace()
@@ -33,6 +55,19 @@ def git_tool(
         ws = get_workspace()
         if not ws.exists():
             return {"success": False, "stdout": "", "stderr": "Workspace does not exist", "exit_code": 1}
+
+        repo = find_repo_root(ws)
+        if repo is None:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    f"No git repository found at or below {ws}. "
+                    "Do NOT suggest running git init without checking first — "
+                    "the repository may simply be in a different directory."
+                ),
+                "exit_code": 1,
+            }
         
         safe_path = None
         if path and path != ".":
@@ -64,7 +99,7 @@ def git_tool(
                 return {"success": False, "stdout": "", "stderr": "commit message is required", "exit_code": 1}
             check = subprocess.run(
                 ["git", "diff", "--staged", "--quiet"],
-                cwd=str(ws),
+                cwd=str(repo),
                 capture_output=True,
                 text=True,
             )
@@ -100,7 +135,7 @@ def git_tool(
         timeout = 30 if subcommand in ("push", "pull", "merge") else 10
         result = subprocess.run(
             cmd,
-            cwd=str(ws),
+            cwd=str(repo),
             capture_output=True,
             text=True,
             timeout=timeout,

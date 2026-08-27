@@ -436,43 +436,62 @@ def test_confirmation_precedes_the_write():
             target.unlink()
 
 
-def test_confirmation_question_names_the_action():
-    """A bare 'Continue?' is meaningless once the panel scrolls away."""
-    from app.ui.panels import show_confirmation
+def test_confirmation_offers_selectable_choices():
+    """The prompt is a selectable dialog, not a typed y/N."""
+    import app.ui.panels as panels
+    from app.ui.confirm import ALWAYS, APPROVE, DECLINE
 
-    asked = {}
+    seen = {}
 
-    def fake_input(question):
-        asked["q"] = question
-        return "y"
+    def fake_ask(title, detail, caution, choices):
+        seen["title"] = title
+        seen["detail"] = detail
+        seen["choices"] = [c.value for c in choices]
+        return "approve"
 
-    with patch("builtins.input", fake_input):
-        approved = show_confirmation("app/skills/notes.md (961 bytes)", "write")
+    set_mode(PermissionMode.DEFAULT)
+    with patch.object(panels, "ask_choice", fake_ask, create=True), \
+         patch("app.ui.confirm.ask_choice", fake_ask):
+        approved = panels.show_confirmation("app/skills/notes.md (961 bytes)", "write")
 
-    check(approved is True, "an approved action returns True")
-    check("write" in asked["q"] and "notes.md" in asked["q"],
-          f"the question names the action and target (got {asked['q']!r})")
+    check(approved is True, "approving returns True")
+    check("notes.md" in seen["detail"], f"the target is named (got {seen['detail']!r})")
+    check("Write" in seen["title"], f"the action is named (got {seen['title']!r})")
+    check(seen["choices"][-1] == "decline",
+          "declining is last, so it is the safe default on abort")
+    check("always" in seen["choices"],
+          "default mode offers 'stop asking' for writes")
+    set_mode(PermissionMode.DEFAULT)
 
-    with patch("builtins.input", lambda q: "n"):
-        check(show_confirmation("rm -rf build/", "destructive") is False,
-              "a declined action returns False")
+
+def test_confirmation_decline_and_always():
+    import app.ui.panels as panels
+    from app.permissions.mode import get_mode
+
+    set_mode(PermissionMode.DEFAULT)
+    with patch("app.ui.confirm.ask_choice", lambda *a, **k: "decline"):
+        check(panels.show_confirmation("rm -rf build/", "destructive") is False,
+              "declining returns False")
+
+    with patch("app.ui.confirm.ask_choice", lambda *a, **k: "always"):
+        approved = panels.show_confirmation("a.py (10 bytes)", "write")
+    check(approved is True, "'always' approves this action")
+    check(get_mode() is PermissionMode.AUTO_EDIT,
+          "'always' switches to auto-edit so it stops asking")
+    set_mode(PermissionMode.DEFAULT)
 
 
-def test_retry_reruns_the_previous_prompt():
-    """/retry was not a command at all — it went to the model as literal text."""
-    seen = []
+def test_confirmation_never_blocks_without_a_terminal():
+    """A dialog that waits for a keypress nobody can send would hang the CLI."""
+    import time
 
-    def step(self, message):
-        seen.append(message)
-        yield AgentEvent(type="agent_message", message="ok")
+    from app.ui.confirm import APPROVE, DECLINE, ask_choice
 
-    _drive([("find the parser\r", 0.4), ("/retry\r", 0.5), ("exit\r", 0.2)], step)
-    check(seen == ["find the parser", "find the parser"],
-          f"/retry re-ran the previous prompt (got {seen})")
-
-    seen.clear()
-    _drive([("/retry\r", 0.4), ("exit\r", 0.2)], step)
-    check(seen == [], "/retry with no history runs nothing")
+    started = time.monotonic()
+    result = ask_choice("File Write", "a.py", "overwrites", [APPROVE, DECLINE])
+    elapsed = time.monotonic() - started
+    check(elapsed < 2.0, f"returns immediately with no tty ({elapsed:.2f}s)")
+    check(result == "decline", "falls back to the safe choice")
 
 
 # ── Status surfaces ─────────────────────────────────────────────────

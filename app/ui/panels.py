@@ -195,30 +195,31 @@ def show_confirmation(detail: str, kind: str = "destructive") -> bool:
     Installed as the permission layer's approver, so this is the only path
     by which a write, shell, or destructive action can be allowed.
     """
-    title, caution = _CONFIRM_TITLES.get(kind, _CONFIRM_TITLES["destructive"])
-    console.print()
-    show_error_panel(title, detail)
-    console.print(f"  {caution}", style="warning")
+    from app.permissions.mode import PermissionMode, get_mode, set_mode
+    from app.ui.confirm import ALWAYS, APPROVE, DECLINE, ask_choice
 
-    # Rich buffers through prompt_toolkit's stdout proxy while input() writes
-    # straight to the terminal, so without this flush the question can appear
-    # after output it precedes. Force the panel out before asking.
+    title, caution = _CONFIRM_TITLES.get(kind, _CONFIRM_TITLES["destructive"])
+
+    choices = [APPROVE]
+    # Only offer "stop asking" where a mode exists that actually stops asking.
+    if kind == "write" and get_mode() is PermissionMode.DEFAULT:
+        choices.append(ALWAYS)
+    choices.append(DECLINE)
+
+    console.print()
     try:
         console.file.flush()
     except (OSError, ValueError, AttributeError):
         pass
 
-    # The question names the action and target: if the panel scrolls away,
-    # "Continue?" alone gives no clue what is being approved.
-    subject = _one_line_detail(detail)
-    question = f"  ▸ Allow {kind} {subject}? [y/N] "
-    try:
-        answer = input(question).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        console.print("\n  Aborted.", style="dim")
-        return False
+    answer = ask_choice(title, _one_line_detail(detail, 64), caution, choices)
 
-    approved = answer in {"y", "yes"}
+    if answer == "always":
+        set_mode(PermissionMode.AUTO_EDIT)
+        console.print("  ✓ approved — switched to auto-edit mode", style="success")
+        return True
+
+    approved = answer == "approve"
     console.print(
         "  ✓ approved" if approved else "  ✗ declined",
         style="success" if approved else "error",
