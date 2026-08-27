@@ -45,6 +45,55 @@ ENV
 Then run `vektorcode` in any project directory, or `vektorcode "a prompt"`
 for a single turn.
 
+## Local and Hugging Face models
+
+VektorCode talks to any OpenAI-compatible endpoint, so a locally-served HF
+model needs no code changes — only a different base URL.
+
+```bash
+ollama serve                       # or any OpenAI-compatible server
+ollama pull qwen2.5:7b
+```
+
+Then inside VektorCode:
+
+```
+/models                 # lists local servers it can reach, and how to switch
+/endpoint local         # jumps to VEKTOR_LOCAL_ENDPOINT or a discovered server
+/model qwen2.5:7b
+```
+
+Set `VEKTOR_LOCAL_ENDPOINT=http://127.0.0.1:11434/v1` in your `.env` so
+`/endpoint local` works every session without retyping the URL.
+
+### Tool-calling reliability is the thing that matters
+
+Far more than parameter count or benchmark scores. VektorCode drives every
+tool through textual `<tool_call>` blocks, and a model that cannot sustain
+that loop is unusable as an agent regardless of how well it writes prose.
+
+Measured on this project, four representative tasks each:
+
+| Model | Serving | Clean runs | Avg / task | Notes |
+|---|---|---|---|---|
+| `nemotron-3-super` | vLLM (remote) | 3/4 | 10.1s | current default |
+| `gemma4:latest` | Ollama (local) | 3/4 | 57.3s | no tool-calling fine-tune; loops on multi-step tasks |
+| `gpt-oss-120b` | vLLM (remote) | — | — | emits a tool call ~1/8; needs a tool-call parser enabled server-side |
+
+A "clean run" used at least one tool and hit no loop-detection, iteration
+cap or agent error.
+
+What this says: parses single tool calls fine, but sustaining a multi-step
+loop is a different capability. gemma4 issued correct `list_files`,
+`read_file` and `search_code` calls with correct arguments, then repeated
+`list_files` until loop detection stopped it. Local costs 5.7x the latency
+for the same success rate, so it is worth it for offline or privacy
+reasons, not for quality.
+
+Prefer models with an explicit tool-calling or function-calling fine-tune —
+Qwen2.5-Instruct and Hermes-3 are the usual recommendations. Base and plain
+instruct models will parse a call and then fail to keep the loop going.
+
 ## Project Structure
 
 ```
