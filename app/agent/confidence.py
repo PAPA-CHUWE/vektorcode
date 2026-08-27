@@ -22,6 +22,10 @@ from dataclasses import dataclass
 # deployment without a code change.
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 
+# At or above this, a needs_clarification flag is disregarded: the model
+# cannot be both this sure and unable to proceed.
+CONFIDENT_ENOUGH = 0.85
+
 
 def confidence_threshold() -> float:
     """Threshold from CONFIDENCE_THRESHOLD, or the default."""
@@ -34,8 +38,13 @@ def confidence_threshold() -> float:
 
 
 CONFIDENCE_INSTRUCTION = """\
-If the request is ambiguous enough that you would be guessing at what was
-meant, say so instead of guessing. Prepend exactly one line:
+Only ask for clarification when no amount of looking would resolve the
+ambiguity. If you could find the answer with list_files, read_file or
+search_code, use the tool instead of asking. "This project" means the
+workspace you are running in — go and look at it.
+
+If the request is genuinely ambiguous in a way tools cannot settle, say so
+instead of guessing. Prepend exactly one line:
 
     {"confidence": <0.0-1.0>, "needs_clarification": <true|false>, "question": "<what you need to know>"}
 
@@ -60,7 +69,13 @@ class ConfidenceSignal:
         if not self.question.strip():
             # Nothing coherent to ask; guessing beats an empty question.
             return False
-        return self.needs_clarification or self.confidence < limit
+        if self.confidence < limit:
+            return True
+        # needs_clarification alone is not enough. Models set it while also
+        # reporting 95% confidence, which is incoherent — and honouring it
+        # produced "Which project?" for a plainly-scoped request, twice in a
+        # row. A stated confidence this high contradicts the flag.
+        return self.needs_clarification and self.confidence < CONFIDENT_ENOUGH
 
 
 def extract(text: str) -> ConfidenceSignal | None:

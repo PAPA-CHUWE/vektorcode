@@ -584,6 +584,9 @@ class Agent:
         # None. Left None in one-shot mode: nobody is typing.
         self.steering_source = None
         self.last_classification: Classification | None = None
+        # The clarification just asked, so the same question is not put
+        # twice in a row after the user has already answered it.
+        self._last_clarification: str = ""
         self.classify_tasks = CLASSIFY_TASKS
         self.budget = BudgetTracker()
         self.budget.load_today(get_workspace() / "logs")
@@ -958,8 +961,13 @@ class Agent:
                     signal = extract_confidence(clean)
                     if signal is not None:
                         clean = signal.body or clean
-                        if signal.should_clarify():
+                        repeat = (
+                            signal.question.strip().lower()
+                            == self._last_clarification.strip().lower()
+                        )
+                        if signal.should_clarify() and not repeat:
                             question = signal.question
+                            self._last_clarification = question
                             self.history.append({"role": "assistant", "content": question})
                             self.session_log.record(task_type.value, user_message, question)
                             _finalize(question, had_error=False)
@@ -990,6 +998,7 @@ class Agent:
                     # prose. Prose is a legitimate answer — rejecting it would
                     # be the structured-output layer making things worse.
 
+                self._last_clarification = ""
                 self.history.append({"role": "assistant", "content": clean})
                 self._log_cycle(iteration, final=True)
                 self.session_log.record(task_type.value, user_message, clean)

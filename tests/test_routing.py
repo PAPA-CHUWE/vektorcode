@@ -249,6 +249,49 @@ def test_clear_request_does_not_trigger_clarification():
           "an empty question does not gate")
 
 
+def test_high_confidence_overrides_the_clarification_flag():
+    """Observed live: the model reported 95% confidence AND set
+    needs_clarification, producing "Which project?" for a plainly-scoped
+    request. A stated confidence that high contradicts the flag."""
+    from app.agent.confidence import CONFIDENT_ENOUGH, ConfidenceSignal
+
+    incoherent = ConfidenceSignal(0.95, True, "Which project?", "body")
+    check(not incoherent.should_clarify(),
+          f"confidence >= {CONFIDENT_ENOUGH} disregards the flag")
+
+    genuinely_unsure = ConfidenceSignal(0.78, True, "Which project?", "body")
+    check(genuinely_unsure.should_clarify(),
+          "a real mid-range doubt plus the flag still asks")
+
+    low = ConfidenceSignal(0.2, False, "Fix what?", "body")
+    check(low.should_clarify(), "low confidence alone still asks")
+
+
+def test_the_same_question_is_not_asked_twice_running():
+    """Observed live: it asked "Which project?", the user answered "this
+    project", and it asked the identical question again."""
+    original = A.CLASSIFY_TASKS
+    A.CLASSIFY_TASKS = True
+    ask = ('{"confidence": 0.4, "needs_clarification": true, '
+           '"question": "Which project?"}\nGuessing.')
+    try:
+        with patch.object(A, "chat", side_effect=[_reply(ask), _reply(ask)]), \
+             patch.object(A, "classify",
+                          lambda m, f: Classification(TaskType.QA, 0.5)):
+            agent = Agent()
+            first = list(agent.step("tell me about the project"))
+            second = list(agent.step("this project"))
+    finally:
+        A.CLASSIFY_TASKS = original
+
+    asks = [e for e in first + second if e.type == "clarification_needed"]
+    check(len(asks) == 1, f"asked once, not repeatedly ({len(asks)})")
+    check(second[-1].type == "agent_message",
+          f"the second turn answers instead of re-asking ({second[-1].type})")
+    check("confidence" not in second[-1].message,
+          "the raw signal line never reaches the user")
+
+
 def test_deterministic_tool_work_is_not_confidence_gated():
     """Tool calls succeed or return a real exit code; no soft signal needed."""
     check(not Classification(TaskType.CODING, 0.9).is_confidence_gated,
