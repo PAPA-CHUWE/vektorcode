@@ -123,6 +123,27 @@ def test_capability_honesty_skill_matches_vision_question():
               f"{question!r} → capability-honesty (got {names})")
 
 
+def test_negative_result_skill_matches_existence_questions():
+    """Asked "is the colour palette being used", the agent searched for the
+    literal word "palette", found nothing, and answered no — while the
+    palette sat in console.py as VEKTOR_THEME."""
+    skills = load_skills()
+    for question in [
+        "is the colour palette being used now",
+        "do we have any rate limiting",
+        "is there a config file for this",
+        "does it have dark mode",
+    ]:
+        names = [s.name for s in match_skills(question, skills)]
+        check("negative-result-caution" in names,
+              f"{question!r} → negative-result-caution (got {names})")
+
+    # Must not fire on ordinary work.
+    quiet = [s.name for s in match_skills("read app/main.py and summarise it", skills)]
+    check("negative-result-caution" not in quiet,
+          f"a plain read request does not trigger it (got {quiet})")
+
+
 def test_injection_is_capped():
     """All 16 bodies are ~13KB; a small context window cannot take them all."""
     many = [Skill(name=f"s{i}", triggers=("common",), body=f"body {i}") for i in range(10)]
