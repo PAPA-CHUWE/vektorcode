@@ -9,14 +9,15 @@ description = "AI coding agent for the terminal"
 readme = "README.md"
 # 17 modules use PEP 604 `X | Y` unions; nothing needs 3.11+.
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 authors = [{ name = "Terrence Chuwe", email = "terrence.chuwe@cassava.ai" }]
 keywords = ["ai", "agent", "cli", "coding-assistant", "llm"]
 classifiers = [
+    # Blocks accidental upload to PyPI, which rejects this classifier.
+    "Private :: Do Not Upload",
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -52,4 +53,4 @@ packages = ["app"]
 # because a wheel without them silently disables every skill.
 
 [tool.hatch.build.targets.sdist]
-include = ["app", "tests", "README.md", "pyproject.toml"]
+include = ["app", "tests", "README.md", "LICENSE", "pyproject.toml"]

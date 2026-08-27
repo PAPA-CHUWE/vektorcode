@@ -117,6 +117,36 @@ def test_requires_python_matches_the_syntax_used():
     check(bool(uses_pep604), f"PEP 604 syntax is in fact used ({len(uses_pep604)} files)")
 
 
+def test_licence_is_declared_and_not_permissive_by_accident():
+    """pyproject once declared MIT with no LICENSE file to back it — a
+    standing grant to use, sell and close-source the project."""
+    from importlib.metadata import PackageNotFoundError, metadata
+
+    project = _pyproject()["project"]
+    licence_file = ROOT / "LICENSE"
+
+    check(licence_file.is_file(), "a LICENSE file exists")
+    check(project.get("license", {}).get("file") == "LICENSE",
+          f"pyproject points at it ({project.get('license')})")
+
+    classifiers = project.get("classifiers", [])
+    osi = [c for c in classifiers if c.startswith("License :: OSI Approved")]
+    check(not osi, f"no OSI licence classifier is claimed ({osi})")
+    check("Private :: Do Not Upload" in classifiers,
+          "the private classifier blocks an accidental PyPI upload")
+
+    text = licence_file.read_text(encoding="utf-8")
+    check("All rights reserved" in text, "the licence reserves rights")
+
+    # The built artifact must agree with the repo.
+    try:
+        declared = metadata("vektorcode")["License"] or ""
+        check("All rights reserved" in declared,
+              f"installed metadata agrees ({declared.splitlines()[0][:50]})")
+    except PackageNotFoundError:
+        check(True, "not installed here; repo declaration checked instead")
+
+
 def test_readme_leads_with_pipx():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     check("pipx install vektorcode" in readme, "README documents the pipx install")
