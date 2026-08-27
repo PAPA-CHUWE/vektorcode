@@ -50,6 +50,8 @@ def _build_registry() -> tuple[list[CommandMeta], dict[str, Callable[..., Any]]]
         CommandMeta("/tools",     "Show available tools"),
         CommandMeta("/clear",     "Clear conversation history"),
         CommandMeta("/retry",     "Re-run your previous message"),
+        CommandMeta("/undo",      "Revert the last file change (/undo N for more)"),
+        CommandMeta("/changes",   "List reversible file changes this session"),
         CommandMeta("/skills",    "List guidance skills (or test which match a phrase)"),
         CommandMeta("/tokens",    "Toggle token counts in the status bar"),
         CommandMeta("/queue",     "List queued messages (clear | pop)"),

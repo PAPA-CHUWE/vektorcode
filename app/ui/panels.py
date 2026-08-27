@@ -461,3 +461,44 @@ def show_status_table(rows: list[tuple[str, str]]) -> None:
     console.print()
     console.print(table)
     console.print()
+
+
+# An unbounded plan-editing loop is itself a steerability failure.
+MAX_PLAN_ROUNDS = 3
+
+
+def review_plan(steps: list[str], round_number: int = 1) -> tuple[str, str]:
+    """Show a plan and ask what to do with it.
+
+    Returns (decision, text) where decision is "approve", "edit" or
+    "reject". For "edit", text is the user's natural-language change.
+    """
+    from app.ui.confirm import Choice, ask_choice
+
+    show_plan(steps)
+    if round_number > 1:
+        console.print(f"  revision {round_number} of {MAX_PLAN_ROUNDS}", style="dim")
+
+    decision = ask_choice(
+        "Proceed with this plan?",
+        f"{len(steps)} step{'s' if len(steps) != 1 else ''}",
+        "You can change it before anything runs.",
+        [
+            Choice("Yes, go ahead", "approve", "y"),
+            Choice("Change something", "edit", "e"),
+            Choice("No, let me restate it", "reject", "n"),
+        ],
+    )
+
+    if decision != "edit":
+        return decision, ""
+
+    try:
+        console.file.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        edit = input("  What should change? ").strip()
+    except (EOFError, KeyboardInterrupt, OSError, ValueError):
+        return "reject", ""
+    return ("edit", edit) if edit else ("approve", "")

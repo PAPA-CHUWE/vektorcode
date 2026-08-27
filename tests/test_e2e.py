@@ -503,7 +503,7 @@ def test_command_registry():
 
     # Registry has all expected commands
     expected = {"/help", "/status", "/model", "/models", "/endpoint",
-                "/auth", "/workspace", "/tools", "/clear", "/retry", "/skills",
+                "/auth", "/workspace", "/tools", "/clear", "/retry", "/undo", "/changes", "/skills",
                 "/tokens", "/trace", "/queue", "/mode", "/reload", "/exit"}
     actual = {c.name for c in COMMAND_registry}
     assert expected == actual

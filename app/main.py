@@ -51,6 +51,7 @@ from app.ui.panels import (
     token_display_enabled,
 )
 from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
+from app.ui.panels import MAX_PLAN_ROUNDS, review_plan
 from app.ui.toolfeed import ToolFeed
 from app.ui.queue import MessageQueue
 from app.ui.input import INTERRUPT
@@ -232,6 +233,11 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
 
     elif t == "stall_detected":
         console.print(f"  ⟲ no progress — {event.message}; reassessing", style="warning")
+
+    elif t == "plan_rejected":
+        console.print()
+        console.print(f"  ✗ {event.message}", style="warning")
+        console.print()
 
     elif t == "task_classified":
         confidence = event.data.get("confidence", 0.0)
@@ -420,6 +426,38 @@ def dispatch_command(
         }
         show_tools_table(grouped, len(registry.list_available()))
         return
+    if cmd_name == "/undo":
+        store = agent.checkpoints
+        if not len(store):
+            console.print("\n  Nothing to undo — no file changes this session.\n", style="dim")
+            return
+        try:
+            count = max(1, int(cmd_args[0])) if cmd_args else 1
+        except ValueError:
+            console.print(f"\n  /undo takes a number, not {cmd_args[0]!r}.\n", style="error")
+            return
+
+        # A rollback that contradicts a commit the agent already made is
+        # worth flagging before it happens, not after.
+        warning = store.conflicts_with_git(count)
+        if warning:
+            console.print()
+            console.print(f"  ⚠ {warning}", style="warning")
+
+        reverted, failed = store.undo(count)
+        console.print()
+        for line in reverted:
+            console.print(f"  ↩ {line}", style="success")
+        for line in failed:
+            console.print(f"  ✗ {line}", style="error")
+        remaining = len(store)
+        console.print(f"  {remaining} change(s) still undoable.\n", style="dim")
+        return
+    if cmd_name == "/changes":
+        store = agent.checkpoints
+        rows = [(c.describe(), c.timestamp[11:19]) for c in store.recent()]
+        show_status_table(rows or [("(none)", "no file changes this session")])
+        return
     if cmd_name == "/skills":
         from app.skills.loader import load_skills, match_skills
 
@@ -533,6 +571,59 @@ async def _execute_turn(agent: Agent, message: str, stop: threading.Event) -> bo
     return not failed
 
 
+
+def _make_plan_reviewer(loop, on_main_thread):
+    """Build the agent's plan-review hook.
+
+    Runs the same way as the permission approver: the turn executes in a
+    worker thread while prompt_toolkit owns the terminal, so the prompt has
+    to be suspended before anything can be asked.
+    """
+    from app.agent.planning import Plan, parse_plan, propose as propose_plan
+
+    def revise(plan, instruction):
+        """Ask the model to apply a natural-language edit to the plan."""
+        from app.llm import chat
+
+        try:
+            response = chat([
+                {"role": "system", "content": "You revise plans. Numbered list only."},
+                {"role": "user", "content":
+                    f"Current plan:\n{plan.as_text()}\n\n"
+                    f"Apply this change: {instruction}\n\n"
+                    "Reply with the full revised plan as a numbered list, nothing else."},
+            ])
+            reply = response.choices[0].message
+            text = reply.content or getattr(reply, "reasoning_content", "") or ""
+        except Exception:
+            return plan
+        revised = parse_plan(text)
+        revised.revisions = plan.revisions + 1
+        return revised if revised else plan
+
+    def ask(plan):
+        current = plan
+        for round_number in range(1, MAX_PLAN_ROUNDS + 1):
+            decision, edit = review_plan(current.steps, round_number)
+            if decision == "approve":
+                return True, current
+            if decision == "reject":
+                return False, None
+            current = revise(current, edit)
+        # Negotiation ran out of road; ask for a cleaner statement instead
+        # of looping forever.
+        return False, None
+
+    def reviewer(plan):
+        if on_main_thread():
+            return ask(plan)
+        return asyncio.run_coroutine_threadsafe(
+            run_in_terminal(lambda: ask(plan)), loop
+        ).result()
+
+    return reviewer
+
+
 def _footer(agent: Agent, status: str = "ready") -> None:
     show_context_bar(
         workspace=get_workspace().name,
@@ -577,6 +668,9 @@ async def run_interactive_async() -> None:
 
     # The only path by which a privileged action can be approved.
     set_approver(approve)
+    agent.plan_reviewer = _make_plan_reviewer(
+        loop, lambda: threading.current_thread() is threading.main_thread()
+    )
 
     turn: asyncio.Task | None = None
     stop = threading.Event()

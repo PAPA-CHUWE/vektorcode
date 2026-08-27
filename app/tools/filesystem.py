@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.config import get_workspace
 from app.permissions.mode import WRITE, request_approval
+from app.memory.checkpoints import get_store
 from app.tools.tool_result import ToolResult
 
 
@@ -11,9 +12,12 @@ def _resolve_safe(path: str) -> "Path":
     """Resolve *path* and ensure it stays inside the workspace."""
     from pathlib import Path
 
-    ws = get_workspace()
+    ws = get_workspace().resolve()
     target = (ws / path).resolve()
-    if not str(target).startswith(str(ws)):
+    # is_relative_to, not a string prefix: "/work-evil/secret" starts with
+    # "/work" as text but is not inside it. Both sides are resolved so a
+    # symlinked workspace (/var -> /private/var on macOS) is not rejected.
+    if not target.is_relative_to(ws):
         raise PermissionError(f"Path escapes workspace: {path}")
     return target
 
@@ -75,6 +79,12 @@ def write_file(path: str, content: str) -> "str | ToolResult":
         target = _resolve_safe(path)
         if not request_approval(WRITE, f"{path} ({len(content)} bytes)"):
             return ToolResult.blocked(f"BLOCKED: write to {path} was not approved.")
+
+        # Snapshot before writing, so /undo can restore this. Done here
+        # rather than in the agent so no caller can skip it.
+        store = get_store()
+        if store is not None:
+            store.snapshot(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"

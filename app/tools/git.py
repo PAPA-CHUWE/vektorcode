@@ -35,9 +35,12 @@ def find_repo_root(start: Path) -> Path | None:
 
 def _resolve_safe(path: str) -> Path:
     """Resolve *path* and ensure it stays inside the workspace."""
-    ws = get_workspace()
+    ws = get_workspace().resolve()
     target = (ws / path).resolve()
-    if not str(target).startswith(str(ws)):
+    # is_relative_to, not a string prefix: "/work-evil/secret" starts with
+    # "/work" as text but is not inside it. Both sides are resolved so a
+    # symlinked workspace (/var -> /private/var on macOS) is not rejected.
+    if not target.is_relative_to(ws):
         raise PermissionError(f"Path escapes workspace: {path}")
     return target
 

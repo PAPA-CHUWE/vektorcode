@@ -26,6 +26,7 @@ from app.config import get_endpoint, get_model, get_workspace
 from app.context import ContextManager
 from app.cost import BudgetTracker, TaskLogger, estimate_cost
 from app.agent.classify import Classification, DEFAULT_TASK_TYPE, TaskType, classify
+from app.agent.planning import Plan, propose as propose_plan, should_plan
 from app.agent.confidence import CONFIDENCE_INSTRUCTION, extract as extract_confidence
 from app.agent.schemas import (
     render as render_schema,
@@ -34,7 +35,7 @@ from app.agent.schemas import (
     validate as validate_schema,
 )
 from app.agent.stall import StallDetector
-from app.memory import SessionLog
+from app.memory import CheckpointStore, SessionLog, set_store
 from app.skills.loader import load_skills, match_skills, render_skills
 from app.llm import chat
 from app.tools import get_registry, get_event_bus
@@ -573,6 +574,11 @@ class Agent:
         self.context_manager = ContextManager()
         self.session_cost_usd: float = 0.0
         self.session_log = SessionLog.from_env(get_workspace())
+        self.checkpoints = CheckpointStore(workspace=get_workspace())
+        set_store(self.checkpoints)
+        # Set by the interactive UI. Signature: (Plan) -> (approved, edit).
+        # Left None in one-shot mode, where there is nobody to ask.
+        self.plan_reviewer = None
         self.last_classification: Classification | None = None
         self.classify_tasks = CLASSIFY_TASKS
         self.budget = BudgetTracker()
@@ -719,6 +725,8 @@ class Agent:
             yield AgentEvent(type="error", message=msg)
             return
 
+        self.checkpoints.begin_turn()
+
         # ── Stage 1: classify for routing (never forks the loop) ────
         classification = (
             classify(user_message, chat) if self.classify_tasks
@@ -736,6 +744,20 @@ class Agent:
                 },
             )
 
+        # ── Plan first for work that will span several tool calls ──
+        approved_plan: Plan | None = None
+        if self.plan_reviewer is not None and should_plan(classification, user_message):
+            plan = propose_plan(user_message, chat)
+            if plan:
+                approved, replacement = self.plan_reviewer(plan)
+                if not approved:
+                    note = replacement or "Plan rejected. Restate what you want."
+                    self.history.append({"role": "assistant", "content": note})
+                    self.session_log.record(task_type.value, user_message, note)
+                    yield AgentEvent(type="plan_rejected", message=note)
+                    return
+                approved_plan = replacement or plan
+
         # ── Stage 4: condensed recap of recent turns, not a transcript ──
         recap = self.session_log.recap()
         if recap:
@@ -749,6 +771,12 @@ class Agent:
             framing += CONFIDENCE_INSTRUCTION
         if framing.strip():
             self.history.append({"role": "system", "content": framing.strip(), "framing": True})
+        if approved_plan is not None:
+            self.history.append({
+                "role": "system",
+                "content": approved_plan.as_instruction(),
+                "plan": True,
+            })
 
         self.history.append({"role": "user", "content": user_message})
 
