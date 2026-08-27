@@ -89,7 +89,7 @@ Edit `vektor-code-agent/.env` with your LLM endpoint details:
 
 ```env
 LITELLM_API_KEY=your-api-key
-LITELLM_BASE_URL=http://litellm.cpt-gpu002.internal:30080
+LITELLM_BASE_URL=http://your-endpoint:30080
 LITELLM_MODEL=gemma
 ```
 
