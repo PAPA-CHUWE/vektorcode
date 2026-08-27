@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from rich.panel import Panel
 from rich.text import Text
 
 from app.agent import Agent, AgentEvent
@@ -231,6 +232,24 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
 
     elif t == "stall_detected":
         console.print(f"  ⟲ no progress — {event.message}; reassessing", style="warning")
+
+    elif t == "task_classified":
+        confidence = event.data.get("confidence", 0.0)
+        console.print(f"  · {event.message} ({confidence:.0%})", style="dim")
+
+    elif t == "clarification_needed":
+        # Framed as a question, not a yes/no gate.
+        console.print()
+        console.print(
+            Panel(
+                Text(event.message.strip()),
+                title=Text("? Need a bit more", style="gold"),
+                title_align="left",
+                border_style="gold",
+                width=min(76, console.width),
+            )
+        )
+        console.print()
 
     elif t == "skills_applied":
         console.print(f"  ◆ guidance: {event.message}", style="dim")

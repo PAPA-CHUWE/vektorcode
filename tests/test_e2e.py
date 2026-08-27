@@ -43,6 +43,12 @@ from tests._log_isolation import snapshot as _snapshot_logs
 _LOGS_BEFORE = _snapshot_logs()
 
 
+# These suites script exact chat sequences, so the classification call
+# would consume the first scripted response. Classification has its own
+# dedicated tests below.
+import app.agent.agent as _A
+_A.CLASSIFY_TASKS = False
+
 def _cleanup():
     import shutil
     if TEST_DIR.exists():

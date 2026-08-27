@@ -25,13 +25,26 @@ from typing import Any, Iterator
 from app.config import get_endpoint, get_model, get_workspace
 from app.context import ContextManager
 from app.cost import BudgetTracker, TaskLogger, estimate_cost
+from app.agent.classify import Classification, DEFAULT_TASK_TYPE, TaskType, classify
+from app.agent.confidence import CONFIDENCE_INSTRUCTION, extract as extract_confidence
+from app.agent.schemas import (
+    render as render_schema,
+    retry_instruction,
+    schema_instruction,
+    validate as validate_schema,
+)
 from app.agent.stall import StallDetector
+from app.memory import SessionLog
 from app.skills.loader import load_skills, match_skills, render_skills
 from app.llm import chat
 from app.tools import get_registry, get_event_bus
 from app.tools.tool_registry import format_tools_for_prompt
 from app.tools.events import ToolEvent, ToolEventType
 from app.tools.tool_result import ToolStatus
+
+# Classification costs one extra LLM call per turn. On by default; tests
+# that script an exact chat sequence turn it off.
+CLASSIFY_TASKS = True
 
 MAX_ITERATIONS = 15
 _REPEAT_THRESHOLD = 3
@@ -472,6 +485,33 @@ def _skills() -> list:
     return _SKILLS_CACHE
 
 
+# Guidance appended per task type. The loop is unchanged; only the framing
+# differs, so a misclassification costs tone rather than capability.
+_TASK_GUIDANCE: dict[TaskType, str] = {
+    TaskType.CODING: "",
+    TaskType.SEARCH: (
+        "\nThis is a lookup. Prefer search_code over reading files one by one, "
+        "and report where things are rather than explaining them at length.\n"
+    ),
+    TaskType.SUMMARIZATION: (
+        "\nThis is a summarisation request. Read what you need, then condense. "
+        "Do not pad, and do not restate the source at length.\n"
+    ),
+    TaskType.CREATIVE_WRITING: (
+        "\nThis is a writing request. Write the thing that was asked for, in "
+        "prose. Do not wrap it in JSON, and do not narrate your process.\n"
+    ),
+    TaskType.QA: (
+        "\nThis is a question. Answer it directly. Use tools only if you "
+        "genuinely need to look something up.\n"
+    ),
+    TaskType.CONVERSATIONAL: (
+        "\nThis is conversational. Reply briefly and move on. No tool calls "
+        "are needed for a greeting or an acknowledgement.\n"
+    ),
+}
+
+
 def _build_system_prompt() -> str:
     """Build the system prompt with a tool list generated from the registry."""
     return SYSTEM_PROMPT_TEMPLATE.format(
@@ -532,6 +572,9 @@ class Agent:
         self.output_tokens: int = 0
         self.context_manager = ContextManager()
         self.session_cost_usd: float = 0.0
+        self.session_log = SessionLog.from_env(get_workspace())
+        self.last_classification: Classification | None = None
+        self.classify_tasks = CLASSIFY_TASKS
         self.budget = BudgetTracker()
         self.budget.load_today(get_workspace() / "logs")
         # Status of the most recent tool execution, set by _execute_tool.
@@ -661,6 +704,52 @@ class Agent:
         3. Feed result back as role:"tool" message
         4. Repeat until LLM produces a final response (no tool calls)
         """
+        # The budget gate lives inside the loop, but classification happens
+        # before it — so check here too, or an exhausted budget still pays
+        # for one call.
+        if self.budget.would_exceed(0.0):
+            msg = (
+                f"Daily budget exceeded: ${self.budget.spent_today_usd:.4f} of "
+                f"${self.budget.daily_budget_usd:.2f} already spent today. "
+                "Refusing further model calls until the budget resets."
+            )
+            self.history.append({"role": "user", "content": user_message})
+            self.history.append({"role": "assistant", "content": msg})
+            self.input_tokens = self.output_tokens = self.total_tokens = 0
+            yield AgentEvent(type="error", message=msg)
+            return
+
+        # ── Stage 1: classify for routing (never forks the loop) ────
+        classification = (
+            classify(user_message, chat) if self.classify_tasks
+            else Classification(DEFAULT_TASK_TYPE, 1.0, fell_back=True)
+        )
+        self.last_classification = classification
+        task_type = classification.task_type
+        if not classification.fell_back:
+            yield AgentEvent(
+                type="task_classified",
+                message=task_type.value,
+                data={
+                    "task_type": task_type.value,
+                    "confidence": classification.confidence,
+                },
+            )
+
+        # ── Stage 4: condensed recap of recent turns, not a transcript ──
+        recap = self.session_log.recap()
+        if recap:
+            self.history.append({"role": "system", "content": recap, "recap": True})
+
+        # ── Contextual framing + output shape for this task type ────
+        framing = _TASK_GUIDANCE.get(task_type, "")
+        if classification.is_structured:
+            framing += schema_instruction(task_type)
+        if classification.is_confidence_gated:
+            framing += CONFIDENCE_INSTRUCTION
+        if framing.strip():
+            self.history.append({"role": "system", "content": framing.strip(), "framing": True})
+
         self.history.append({"role": "user", "content": user_message})
 
         # ── Inject any skills this request triggers ─────────────────
@@ -697,6 +786,7 @@ class Agent:
         recent_signatures: list[str] = []
         consecutive_loops = 0
         empty_responses = 0
+        schema_retried = False
         last_tool_name: str = ""
 
         # Per-turn accounting. A turn makes several LLM calls, so usage is
@@ -830,8 +920,47 @@ class Agent:
                 # Store the stripped version: otherwise later turns re-read the
                 # model's own leaked deliberation as a prior real answer.
                 clean = _strip_leaked_reasoning(clean)
+
+                # ── Stage 3: ask rather than guess when unsure ──────
+                if classification.is_confidence_gated:
+                    signal = extract_confidence(clean)
+                    if signal is not None:
+                        clean = signal.body or clean
+                        if signal.should_clarify():
+                            question = signal.question
+                            self.history.append({"role": "assistant", "content": question})
+                            self.session_log.record(task_type.value, user_message, question)
+                            _finalize(question, had_error=False)
+                            yield AgentEvent(
+                                type="clarification_needed",
+                                message=question,
+                                data={"confidence": signal.confidence},
+                            )
+                            return
+
+                # ── Stage 2: validate shapes that are checkable ─────
+                if classification.is_structured:
+                    parsed, error = validate_schema(task_type, clean)
+                    if parsed is not None:
+                        clean = render_schema(parsed)
+                    elif error and not schema_retried and "{" in clean:
+                        # One informed retry, with the specific failure.
+                        schema_retried = True
+                        self.history.append({"role": "assistant", "content": clean})
+                        self.history.append({
+                            "role": "user",
+                            "content": retry_instruction(error),
+                        })
+                        self._log_cycle(iteration, result_status="schema_invalid")
+                        self._cap_history()
+                        continue
+                    # Either a second failure, or the model answered in plain
+                    # prose. Prose is a legitimate answer — rejecting it would
+                    # be the structured-output layer making things worse.
+
                 self.history.append({"role": "assistant", "content": clean})
                 self._log_cycle(iteration, final=True)
+                self.session_log.record(task_type.value, user_message, clean)
                 _finalize(clean, had_error=False)
                 yield AgentEvent(type="agent_message", message=clean)
                 return

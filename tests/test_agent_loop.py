@@ -20,6 +20,12 @@ from app.context.context import (
     get_model_config,
 )
 
+# These suites script exact chat sequences, so the classification call
+# would consume the first scripted response. Classification has its own
+# dedicated tests below.
+import app.agent.agent as _A
+_A.CLASSIFY_TASKS = False
+
 _passed, _failed = 0, 0
 
 
