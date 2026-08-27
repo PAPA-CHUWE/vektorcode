@@ -49,17 +49,38 @@ def cmd_model(args: list[str]) -> str:
 
 
 def cmd_endpoint(args: list[str]) -> str:
-    """Show or set the LLM base URL."""
+    """Show or set the LLM base URL.
+
+    `/endpoint local` switches to VEKTOR_LOCAL_ENDPOINT, or to a discovered
+    local server, so moving to a locally-served model does not mean
+    retyping a URL every session.
+    """
+    from app.commands.models import discover_local, local_endpoint
+
     env = read_env()
     current = env.get("LITELLM_BASE_URL", "(not set)")
 
     if not args:
-        return f"Endpoint: {current}"
+        configured = local_endpoint(env)
+        suffix = f"\nLocal shortcut: {configured}" if configured else ""
+        return f"Endpoint: {current}{suffix}"
 
-    env["LITELLM_BASE_URL"] = args[0]
+    target = args[0]
+    if target.lower() == "local":
+        target = local_endpoint(env)
+        if not target:
+            discovered = discover_local(env)
+            if not discovered:
+                return (
+                    "No local endpoint configured or reachable. Set "
+                    "VEKTOR_LOCAL_ENDPOINT in your .env, or start a local server."
+                )
+            target = discovered[0][1]
+
+    env["LITELLM_BASE_URL"] = target
     write_env(env)
     reload_env(env)
-    return f"Endpoint set to: {args[0]}"
+    return f"Endpoint set to: {target}"
 
 
 def cmd_reload(args: list[str]) -> str:
