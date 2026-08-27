@@ -35,6 +35,7 @@ from app.agent.schemas import (
     validate as validate_schema,
 )
 from app.agent.stall import StallDetector
+from app.agent.steering import as_injection
 from app.memory import CheckpointStore, SessionLog, set_store
 from app.skills.loader import load_skills, match_skills, render_skills
 from app.llm import chat
@@ -579,6 +580,9 @@ class Agent:
         # Set by the interactive UI. Signature: (Plan) -> (approved, edit).
         # Left None in one-shot mode, where there is nobody to ask.
         self.plan_reviewer = None
+        # Polled after every tool call. Returns a correction to apply now, or
+        # None. Left None in one-shot mode: nobody is typing.
+        self.steering_source = None
         self.last_classification: Classification | None = None
         self.classify_tasks = CLASSIFY_TASKS
         self.budget = BudgetTracker()
@@ -1117,6 +1121,21 @@ class Agent:
                 "tool_call_id": tool_call_id,
                 "content": f"Result of {name}({args_repr}):\n{result}",
             })
+
+            # ── Mid-turn steering: a correction cannot wait for the ──
+            # ── turn to end, or by then the damage is done.          ──
+            if self.steering_source is not None:
+                correction = self.steering_source()
+                if correction:
+                    self.history.append({
+                        "role": "user",
+                        "content": as_injection(correction),
+                        "steering": True,
+                    })
+                    task_logger.record_tool_call("steering", {"message": correction}, "success")
+                    yield AgentEvent(type="steering_applied", message=correction)
+                    self._cap_history()
+                    continue
 
             # ── Unproductive loop → nudge, do not wait for the cap ──
             if stall.stalled:

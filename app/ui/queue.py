@@ -56,6 +56,19 @@ class MessageQueue:
         """Take the next message, or None if empty."""
         return self._items.popleft() if self._items else None
 
+    def take_matching(self, predicate) -> str | None:
+        """Remove and return the oldest message satisfying predicate.
+
+        Deliberately out of FIFO order: a correction is time-sensitive and a
+        plain follow-up is not, so pulling "wait, wrong file" past "also
+        update the README" is the behaviour you want.
+        """
+        for index, message in enumerate(self._items):
+            if predicate(message):
+                del self._items[index]
+                return message
+        return None
+
     def pop_last(self) -> str | None:
         """Take the most recently queued message back off the end.
 

@@ -53,6 +53,7 @@ from app.ui.panels import (
 from app.ui.cursor import reset_cursor, set_cursor_busy, set_cursor_ready
 from app.ui.panels import MAX_PLAN_ROUNDS, review_plan
 from app.ui.toolfeed import ToolFeed
+from app.agent.steering import is_steering
 from app.ui.queue import MessageQueue
 from app.ui.input import INTERRUPT
 from app.ui.runstate import run_state
@@ -233,6 +234,9 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
 
     elif t == "stall_detected":
         console.print(f"  ⟲ no progress — {event.message}; reassessing", style="warning")
+
+    elif t == "steering_applied":
+        console.print(f"  ⤳ redirecting: {event.message}", style="warning")
 
     elif t == "plan_rejected":
         console.print()
@@ -672,6 +676,15 @@ async def run_interactive_async() -> None:
         loop, lambda: threading.current_thread() is threading.main_thread()
     )
 
+    def take_steering() -> str | None:
+        """Hand the agent any queued correction, leaving follow-ups queued."""
+        message = queue.take_matching(is_steering)
+        if message is not None:
+            run_state.queued = len(queue)
+        return message
+
+    agent.steering_source = take_steering
+
     turn: asyncio.Task | None = None
     stop = threading.Event()
     last_prompt: str = ""
@@ -811,7 +824,13 @@ async def run_interactive_async() -> None:
                 if turn is not None:
                     position = queue.submit(result.text)
                     run_state.queued = len(queue)
-                    queue.show_queued(result.text, position)
+                    if is_steering(result.text):
+                        console.print(
+                            "  ⤳ steering — will redirect after the current tool call",
+                            style="warning",
+                        )
+                    else:
+                        queue.show_queued(result.text, position)
                     continue
 
                 console.print()
