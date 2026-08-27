@@ -229,6 +229,9 @@ def render_event(event: AgentEvent, feed: ToolFeed | None = None) -> None:
         elif event.tool == "run_command":
             _record_test_counts(event.message)
 
+    elif t == "stall_detected":
+        console.print(f"  ⟲ no progress — {event.message}; reassessing", style="warning")
+
     elif t == "skills_applied":
         console.print(f"  ◆ guidance: {event.message}", style="dim")
 
@@ -308,7 +311,7 @@ def _resolve_activity(engine: ActivityEngine, event: AgentEvent) -> Activity | N
         return engine.resolve_thinking()
     elif event.type == "final_answer":
         return engine.resolve_completed()
-    elif event.type in ("error", "max_iterations_reached"):
+    elif event.type in ("error", "max_iterations_reached", "stall_detected"):
         return engine.resolve_error()
     elif event.type == "context_status":
         # Context warning — show status but don't change activity

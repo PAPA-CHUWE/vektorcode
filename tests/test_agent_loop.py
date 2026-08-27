@@ -383,6 +383,106 @@ def test_unknown_placeholder_is_left_alone():
           "an unmatched placeholder is passed through untouched")
 
 
+# ── Stall detection ─────────────────────────────────────────────────
+
+def _run_stall(request, calls):
+    from app.agent.stall import StallDetector
+
+    detector = StallDetector.for_request(request)
+    for index, (tool, target, result) in enumerate(calls, 1):
+        detector.record(tool, target, result)
+        if detector.stalled:
+            return index
+    return None
+
+
+def test_stall_fires_on_unrelated_scratch_files():
+    """The observed spiral: writing invented files unrelated to the request."""
+    fired = _run_stall("fix the parser in search.py", [
+        ("write_file", "app/tools/test.txt", "Wrote 5 bytes"),
+        ("write_file", "app/tools/test2.txt", "Wrote 6 bytes"),
+        ("write_file", "app/tools/test_quote.txt", "Wrote 7 bytes"),
+        ("write_file", "app/tools/test_newline.txt", "Wrote 8 bytes"),
+        ("write_file", "app/tools/test_heredoc.txt", "Wrote 9 bytes"),
+        ("write_file", "app/tools/test_x.txt", "Wrote 4 bytes"),
+    ])
+    check(fired is not None, f"drift onto invented files is detected (call {fired})")
+
+
+def test_stall_fires_when_results_repeat():
+    """Different calls, no new information."""
+    same = "app\nlogs\ntests"
+    fired = _run_stall("find the parser", [
+        ("list_files", ".", same), ("list_files", ".", same),
+        ("list_files", "app", same), ("list_files", ".", same),
+        ("list_files", "app", same), ("list_files", ".", same),
+    ])
+    check(fired is not None, f"repetition without novelty is detected (call {fired})")
+
+
+def test_stall_stays_silent_on_real_work():
+    """False positives are worse than the spiral: cutting off work that was
+    about to succeed is the failure mode to avoid."""
+    legitimate = {
+        "search then fix then test": ("fix the parser in search.py", [
+            ("search_code", '"def parse" in app', "app/tools/search.py:12"),
+            ("read_file", "app/tools/search.py", "import re\ndef parse(x):\n    return x"),
+            ("read_file", "app/tools/filesystem.py", "def read_file(p):\n    return open(p).read()"),
+            ("write_file", "app/tools/search.py", "Wrote 900 bytes"),
+            ("run_command", "pytest -q", "12 passed in 0.4s"),
+            ("read_file", "app/tools/search.py", "def parse(x, y):\n    return x+y"),
+        ]),
+        "orient then work": ("fix the parser", [
+            ("list_files", ".", "app\ntests\nlogs"),
+            ("list_files", "app", "tools\nui\nagent"),
+            ("list_files", "app/tools", "search.py\nfilesystem.py\nterminal.py"),
+            ("read_file", "app/tools/search.py", "import re\ndef parse(): pass"),
+            ("write_file", "app/tools/search.py", "Wrote 400 bytes"),
+            ("run_command", "pytest -q", "3 passed"),
+        ]),
+        "long read sweep": ("summarise every module in app/ui", [
+            ("list_files", "app/ui", "panels.py\ninput.py\ncursor.py\nqueue.py"),
+            ("read_file", "app/ui/panels.py", "def show_panel(): ...\nimport rich"),
+            ("read_file", "app/ui/input.py", "class VektorInput:\n    def prompt(self): ..."),
+            ("read_file", "app/ui/cursor.py", "def set_cursor_ready(): ...\nimport sys"),
+            ("read_file", "app/ui/queue.py", "class MessageQueue:\n    def push(self): ..."),
+            ("read_file", "app/ui/runstate.py", "class RunState:\n    running = False"),
+        ]),
+    }
+    for label, (request, calls) in legitimate.items():
+        fired = _run_stall(request, calls)
+        check(fired is None, f"no false positive on {label} (fired at {fired})")
+
+
+def test_stall_nudges_the_agent_rather_than_stopping_it():
+    """The intervention costs one iteration; it must not end the turn."""
+    import app.agent.agent as A
+
+    call_count = {"n": 0}
+
+    def drifting(messages, tools=None, model=None):
+        call_count["n"] += 1
+        r = MagicMock()
+        r.choices = [MagicMock()]
+        r.choices[0].message.reasoning_content = None
+        r.usage = None
+        if call_count["n"] <= 6:
+            r.choices[0].message.content = _tc("write_file", path=f"scratch/x{call_count['n']}.txt")
+        else:
+            r.choices[0].message.content = "Reassessed — here is the answer."
+        return r
+
+    with patch.object(A, "chat", drifting), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: f"Wrote {a} bytes"):
+        agent = Agent()
+        events = list(agent.step("fix the parser in search.py"))
+
+    check(any(e.type == "stall_detected" for e in events),
+          f"a stall event was emitted (got {[e.type for e in events]})")
+    check(events[-1].type == "agent_message", "the turn still reached a real answer")
+    check(events[-1].message == "Reassessed — here is the answer.", events[-1].message)
+
+
 # ── Cursor signalling ───────────────────────────────────────────────
 
 def test_cursor_functions_never_raise_on_broken_stdout():

@@ -25,6 +25,7 @@ from typing import Any, Iterator
 from app.config import get_model, get_workspace
 from app.context import ContextManager
 from app.cost import BudgetTracker, TaskLogger, estimate_cost
+from app.agent.stall import StallDetector
 from app.skills.loader import load_skills, match_skills, render_skills
 from app.llm import chat
 from app.tools import get_registry, get_event_bus
@@ -646,6 +647,7 @@ class Agent:
         # at whichever exit this turn takes.
         model_name = get_model()
         task_logger = TaskLogger(get_workspace() / "logs")
+        stall = StallDetector.for_request(user_message)
         turn_input_tokens = 0
         turn_output_tokens = 0
         turn_total_tokens = 0
@@ -871,6 +873,7 @@ class Agent:
 
             self._log_cycle(iteration, tool_call=name, result_status=result_status)
             task_logger.record_tool_call(name, args, result_status)
+            stall.record(name, target, result)
 
             yield AgentEvent(
                 type="tool_result",
@@ -894,6 +897,24 @@ class Agent:
                 "tool_call_id": tool_call_id,
                 "content": f"Result of {name}({args_repr}):\n{result}",
             })
+
+            # ── Unproductive loop → nudge, do not wait for the cap ──
+            if stall.stalled:
+                self._log_cycle(iteration, tool_call=name, loop_detected=True)
+                self.history.append({
+                    "role": "user",
+                    "content": stall.nudge(user_message),
+                })
+                task_logger.errors.append(f"stall: {stall.reason}")
+                yield AgentEvent(
+                    type="stall_detected",
+                    tool=name,
+                    target=target,
+                    message=stall.reason,
+                )
+                stall.reset()
+                self._cap_history()
+                continue
 
             # ── Cap history to prevent context overflow ─────────────
             self._cap_history()
