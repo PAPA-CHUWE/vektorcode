@@ -83,6 +83,9 @@ class ToolResult:
     def __str__(self) -> str:
         """String representation for terminal output."""
         if self.error_msg:
+            # A refusal is not an error; it already says why it was blocked.
+            if self.status == ToolStatus.BLOCKED:
+                return self.error_msg
             return f"Error: {self.error_msg}"
         if self.data is not None:
             if isinstance(self.data, str):

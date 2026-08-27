@@ -27,9 +27,20 @@ WORKSPACE = get_workspace()
 
 TEST_DIR = WORKSPACE / "_test_e2e"
 
+# These tests exercise tool behaviour, not the permission gate. Without an
+# approver installed the gate correctly denies everything, so grant blanket
+# permission here and cover the gate itself in test_permission_gate().
+from app.permissions.mode import PermissionMode, set_mode as _set_mode
+_set_mode(PermissionMode.FULL_AUTO)
+
 
 def _setup():
     TEST_DIR.mkdir(exist_ok=True)
+
+
+from tests._log_isolation import snapshot as _snapshot_logs
+
+_LOGS_BEFORE = _snapshot_logs()
 
 
 def _cleanup():
@@ -40,6 +51,10 @@ def _cleanup():
     test_py = Path("app/test.py")
     if test_py.exists():
         test_py.unlink()
+    # Remove only the task logs this run created — never the whole day
+    # directory, which may hold genuine audit logs from real usage.
+    from tests._log_isolation import restore
+    restore(_LOGS_BEFORE)
 
 
 def test_workspace_is_cwd():
@@ -91,15 +106,62 @@ def test_path_traversal_blocked():
 
 
 def test_destructive_command():
-    result = run_command("rm -rf /tmp/test")
-    assert "BLOCKED" in result, f"Expected BLOCKED: {result}"
+    """Destructive commands are blocked in default mode with nobody to ask."""
+    from app.permissions.mode import PermissionMode, get_mode, set_approver, set_mode
+
+    original = get_mode()
+    try:
+        set_mode(PermissionMode.DEFAULT)
+        set_approver(None)
+        result = str(run_command("rm -rf /tmp/test"))
+        assert "BLOCKED" in result, f"Expected BLOCKED: {result}"
+    finally:
+        set_approver(None)
+        set_mode(original)
     print("  PASS: destructive command blocked")
 
 
-def test_destructive_command_confirm():
-    result = run_command("rm /tmp/nonexistent_file_for_test_12345", confirm=True)
-    assert "BLOCKED" not in result, f"Should not be blocked with confirm=True: {result}"
-    print("  PASS: confirm=true bypass")
+def test_permission_gate():
+    """The agent must not be able to approve its own privileged actions."""
+    import inspect
+    from app.permissions.mode import (
+        PermissionMode, set_approver, set_mode, get_mode,
+    )
+    from app.tools import get_registry
+
+    original = get_mode()
+    try:
+        # "confirm" must not exist — as a parameter or in the LLM schema.
+        assert "confirm" not in inspect.signature(run_command).parameters, \
+            "run_command must not take a model-settable confirm flag"
+        schema = [s for s in get_registry().to_llm_schemas()
+                  if s["function"]["name"] == "run_command"][0]
+        assert "confirm" not in schema["function"]["parameters"]["properties"], \
+            "confirm must not be exposed to the model"
+
+        # No approver available → denied.
+        set_mode(PermissionMode.DEFAULT)
+        set_approver(None)
+        assert "BLOCKED" in str(run_command("rm /tmp/nonexistent_for_test_12345"))
+
+        # Human declines → denied.
+        set_approver(lambda kind, detail: False)
+        assert "BLOCKED" in str(run_command("rm /tmp/nonexistent_for_test_12345"))
+
+        # Human approves → runs.
+        set_approver(lambda kind, detail: True)
+        assert "BLOCKED" not in str(run_command("echo ok"))
+
+        # full-auto never asks.
+        set_mode(PermissionMode.FULL_AUTO)
+        set_approver(lambda kind, detail: (_ for _ in ()).throw(
+            AssertionError("full-auto must not prompt")))
+        assert "BLOCKED" not in str(run_command("rm /tmp/nonexistent_for_test_12345"))
+    finally:
+        set_approver(None)
+        set_mode(original)
+
+    print("  PASS: permission gate (agent cannot self-approve)")
 
 
 def test_destructive_patterns():
@@ -435,7 +497,8 @@ def test_command_registry():
 
     # Registry has all expected commands
     expected = {"/help", "/status", "/model", "/models", "/endpoint",
-                "/auth", "/workspace", "/tools", "/clear", "/reload", "/exit"}
+                "/auth", "/workspace", "/tools", "/clear", "/tokens",
+                "/trace", "/queue", "/mode", "/reload", "/exit"}
     actual = {c.name for c in COMMAND_registry}
     assert expected == actual
 
@@ -485,7 +548,7 @@ def test_regress_tool_then_final_response():
 
 
 def test_regress_repeated_tool_call():
-    """Test 2: Same tool call repeated → loop detected → controlled termination."""
+    """Test 2: Same tool call repeated → loop feedback → force stop after 3 loops."""
     call_resp = MagicMock()
     call_resp.choices = [MagicMock()]
     call_resp.choices[0].message.content = (
@@ -496,9 +559,11 @@ def test_regress_repeated_tool_call():
         agent = Agent()
         events = list(agent.step("list files"))
 
+    # Should get: tool_start, tool_result, then 3 loop feedbacks, then force stop error
+    tool_starts = [e for e in events if e.type == "tool_start"]
+    assert len(tool_starts) == 1, f"Expected 1 tool_start, got {len(tool_starts)}"
     assert events[-1].type == "error"
-    assert "Loop detected" in events[-1].message
-    assert "list_files" in events[-1].message
+    assert "stopped" in events[-1].message.lower() or "giving up" in events[-1].message.lower()
     print("  PASS: regress repeated tool call")
 
 
@@ -730,6 +795,576 @@ def test_agent_emits_tool_events():
     print("  PASS: agent emits tool events")
 
 
+def test_read_file_truncation():
+    """Test that read_file truncates large files with metadata."""
+    from app.tools.filesystem import read_file
+
+    _setup()
+    # Create a file with >500 lines
+    big_content = "\n".join(f"line {i}" for i in range(600))
+    write_file("_test_e2e/big.py", big_content)
+
+    result = read_file("_test_e2e/big.py")
+    assert "truncated" in result
+    assert "lines 1-500 of 600" in result
+    assert "line 0" in result
+    assert "line 499" in result
+
+    # Small file should NOT be truncated
+    write_file("_test_e2e/small.py", "x = 1")
+    result = read_file("_test_e2e/small.py")
+    assert "truncated" not in result
+    assert "x = 1" in result
+
+    print("  PASS: read_file truncation")
+
+
+def test_truncate_only_targets_tool_role():
+    """Test that _truncate_tool_outputs only truncates role:tool messages."""
+    from app.context.context import _truncate_tool_outputs
+
+    messages = [
+        {"role": "system", "content": "sys prompt " * 500},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "thinking " * 500},
+        {"role": "tool", "tool_call_id": "c1", "content": "result " * 500},
+    ]
+
+    truncated = _truncate_tool_outputs(messages, max_output_chars=200)
+
+    # System, user, assistant should be untouched
+    assert truncated[0]["content"] == messages[0]["content"]
+    assert truncated[1]["content"] == messages[1]["content"]
+    assert truncated[2]["content"] == messages[2]["content"]
+    # Tool should be truncated
+    assert "truncated" in truncated[3]["content"]
+    assert len(truncated[3]["content"]) < len(messages[3]["content"])
+
+    print("  PASS: truncate only targets tool role")
+
+
+def test_tool_protocol_stripped_from_history():
+    """Test that <tool_call> markup is stripped from stored assistant messages."""
+    from unittest.mock import patch, MagicMock
+
+    tool_resp = MagicMock()
+    tool_resp.choices = [MagicMock()]
+    tool_resp.choices[0].message.content = (
+        'Let me check.\n<tool_call>\n{"name": "get_config", "arguments": {}}\n</tool_call>'
+    )
+    final_resp = MagicMock()
+    final_resp.choices = [MagicMock()]
+    final_resp.choices[0].message.content = "Done."
+
+    with patch("app.agent.agent.chat", side_effect=[tool_resp, final_resp]):
+        agent = Agent()
+        list(agent.step("check config"))
+
+    # The assistant message in history should NOT contain <tool_call> tags
+    assistant_msgs = [m for m in agent.history if m.get("role") == "assistant"]
+    assert len(assistant_msgs) >= 1
+    for msg in assistant_msgs:
+        assert "<tool_call>" not in msg["content"], f"Protocol leak: {msg['content'][:100]}"
+        assert "</tool_call>" not in msg["content"]
+
+    print("  PASS: tool protocol stripped from history")
+
+
+# ── Cost accounting ─────────────────────────────────────────────────
+
+def _usage_response(content, prompt_tokens, completion_tokens):
+    from unittest.mock import MagicMock
+
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = content
+    resp.choices[0].message.reasoning_content = None
+    usage = MagicMock()
+    usage.prompt_tokens = prompt_tokens
+    usage.completion_tokens = completion_tokens
+    usage.total_tokens = prompt_tokens + completion_tokens
+    resp.usage = usage
+    return resp
+
+
+def _tool_call(name, **args):
+    import json as _json
+    return f'<tool_call>\n{{"name": "{name}", "arguments": {_json.dumps(args)}}}\n</tool_call>'
+
+
+def test_regress_token_usage_cumulative_across_tool_chain():
+    """Usage must be summed across a turn, not overwritten per call."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    responses = [
+        _usage_response(_tool_call("read_file", path="a.py"), 100, 10),
+        _usage_response(_tool_call("write_file", path="a.py", content="x"), 200, 20),
+        _usage_response("Done.", 300, 30),
+    ]
+    with patch.object(A, "chat", side_effect=responses), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: "ok"):
+        agent = Agent()
+        list(agent.step("edit a.py"))
+
+    assert agent.input_tokens == 600, f"input {agent.input_tokens} != 600 (sum of 100+200+300)"
+    assert agent.output_tokens == 60, f"output {agent.output_tokens} != 60 (sum of 10+20+30)"
+    assert agent.total_tokens == 660, f"total {agent.total_tokens} != 660"
+    print("  PASS: token usage is cumulative across a tool chain")
+
+
+def test_token_usage_ignores_non_numeric_mock_usage():
+    """An auto-mocked usage object must not fabricate token counts."""
+    from unittest.mock import MagicMock, patch
+    import app.agent.agent as A
+
+    resp = MagicMock()
+    resp.choices = [MagicMock()]
+    resp.choices[0].message.content = "Hello."
+    resp.choices[0].message.reasoning_content = None
+    # .usage left as an auto-created MagicMock: int(MagicMock()) == 1.
+
+    with patch.object(A, "chat", return_value=resp):
+        agent = Agent()
+        list(agent.step("hi"))
+
+    assert agent.input_tokens == 0, f"fabricated input tokens: {agent.input_tokens}"
+    assert agent.output_tokens == 0, f"fabricated output tokens: {agent.output_tokens}"
+    assert agent.total_tokens == 0, f"fabricated total tokens: {agent.total_tokens}"
+    print("  PASS: non-numeric usage coerces to zero, not one")
+
+
+def test_cost_estimate_zero_for_local_models():
+    from app.cost import estimate_cost
+
+    assert estimate_cost("qwen", 1_000_000, 1_000_000) == 0.0
+    assert estimate_cost("gpt-oss-120b", 500_000, 500_000) == 0.0
+    assert estimate_cost("nemotron-3-super", 10_000, 10_000) == 0.0
+    print("  PASS: local models cost nothing per token")
+
+
+def test_cost_estimate_env_override():
+    from app.cost import estimate_cost, get_model_pricing
+
+    before_in = os.environ.get("LITELLM_INPUT_COST_PER_1M")
+    before_out = os.environ.get("LITELLM_OUTPUT_COST_PER_1M")
+    try:
+        os.environ["LITELLM_INPUT_COST_PER_1M"] = "3.00"
+        os.environ["LITELLM_OUTPUT_COST_PER_1M"] = "15.00"
+
+        pricing = get_model_pricing("qwen")
+        assert pricing.input_per_1m == 3.00, pricing
+        assert pricing.output_per_1m == 15.00, pricing
+
+        # 1M in + 1M out = $3 + $15
+        cost = estimate_cost("qwen", 1_000_000, 1_000_000)
+        assert abs(cost - 18.00) < 1e-9, cost
+    finally:
+        for key, value in (("LITELLM_INPUT_COST_PER_1M", before_in),
+                           ("LITELLM_OUTPUT_COST_PER_1M", before_out)):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("  PASS: env vars override model pricing")
+
+
+def test_budget_tracker_blocks_over_budget():
+    from app.cost import BudgetTracker
+
+    budget = BudgetTracker(1.00)
+    budget.record(0.50)
+    assert not budget.would_exceed(), "0.50 of 1.00 should not exceed"
+    assert abs(budget.remaining_usd - 0.50) < 1e-9
+
+    budget.record(0.60)
+    assert budget.would_exceed(), "1.10 of 1.00 should exceed"
+    assert budget.remaining_usd == 0.0
+
+    # Landing exactly on the ceiling must block the next call.
+    exact = BudgetTracker(1.00)
+    exact.record(1.00)
+    assert exact.would_exceed(0.0), "spend equal to the budget must block"
+    print("  PASS: budget tracker blocks at and over budget")
+
+
+def test_agent_stops_when_daily_budget_exhausted():
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    called = []
+
+    def spy(*a, **k):
+        called.append(1)
+        raise AssertionError("chat() must not be called when over budget")
+
+    with patch.object(A, "chat", spy):
+        agent = Agent()
+        agent.budget.spent_today_usd = agent.budget.daily_budget_usd
+        events = list(agent.step("do something expensive"))
+
+    assert not called, "the LLM was called despite an exhausted budget"
+    assert events, "expected an error event"
+    assert events[-1].type == "error", f"expected error, got {events[-1].type}"
+    assert "budget" in events[-1].message.lower(), events[-1].message
+    print("  PASS: agent refuses to call the model when the budget is spent")
+
+
+def test_task_log_written_with_expected_fields():
+    from datetime import date
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    day_dir = WORKSPACE / "logs" / date.today().isoformat()
+    before = set(day_dir.glob("task-*.json")) if day_dir.exists() else set()
+
+    responses = [
+        _usage_response(_tool_call("read_file", path="a.py"), 100, 10),
+        _usage_response("All done.", 50, 5),
+    ]
+    with patch.object(A, "chat", side_effect=responses), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: "ok"):
+        agent = Agent()
+        list(agent.step("inspect a.py"))
+
+    after = set(day_dir.glob("task-*.json"))
+    fresh = after - before
+    assert fresh, f"no task log written under {day_dir}"
+
+    payload = json.loads(sorted(fresh)[-1].read_text(encoding="utf-8"))
+    expected = {
+        "task", "timestamp", "model", "input_tokens", "output_tokens",
+        "total_tokens", "estimated_cost_usd", "files_accessed",
+        "files_modified", "tools_called", "tests_executed", "result",
+        "errors", "had_error", "duration_seconds",
+    }
+    missing = expected - set(payload)
+    assert not missing, f"task log missing fields: {sorted(missing)}"
+
+    assert payload["task"] == "inspect a.py", payload["task"]
+    assert payload["input_tokens"] == 150, payload["input_tokens"]
+    assert payload["output_tokens"] == 15, payload["output_tokens"]
+    assert payload["tools_called"] == ["read_file"], payload["tools_called"]
+    assert payload["files_accessed"] == ["a.py"], payload["files_accessed"]
+    assert payload["had_error"] is False
+    print("  PASS: task log written with the expected shape")
+
+
+# ── MAX_ITERATIONS give-up path ─────────────────────────────────────
+
+def _iteration_exhausting_responses(final):
+    """15 distinct tool calls (so loop detection never trips) + a 16th reply."""
+    from app.agent.agent import MAX_ITERATIONS
+
+    responses = [
+        _usage_response(_tool_call("read_file", path=f"f{i}.py"), 10, 1)
+        for i in range(MAX_ITERATIONS)
+    ]
+    responses.append(final)
+    return responses
+
+
+def test_max_iterations_asks_model_for_real_summary():
+    """The give-up text must be the model's words, not a bookkeeping string."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    written = ("I inspected fifteen files without locating the parser. "
+               "Unresolved: which module owns tokenization. "
+               "I'd need the module name to finish.")
+    responses = _iteration_exhausting_responses(_usage_response(written, 20, 5))
+
+    with patch.object(A, "chat", side_effect=responses), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: "ok"):
+        agent = Agent()
+        events = list(agent.step("find the parser"))
+
+    last = events[-1]
+    assert last.type == "max_iterations_reached", f"got {last.type}"
+    assert last.message == written, f"expected the model's summary, got {last.message!r}"
+    assert "Provide a summary of findings so far" not in last.message
+    print("  PASS: max-iterations summary is written by the model")
+
+
+def test_max_iterations_event_is_not_agent_message():
+    """The old bug's exact symptom: give-up rendered as a normal answer."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    responses = _iteration_exhausting_responses(_usage_response("Ran out of room.", 20, 5))
+
+    with patch.object(A, "chat", side_effect=responses), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: "ok"):
+        agent = Agent()
+        events = list(agent.step("find the parser"))
+
+    for event in events:
+        assert event.type != "agent_message", \
+            f"give-up path emitted agent_message: {event.message!r}"
+        assert "Provide a summary of findings so far" not in event.message
+    print("  PASS: give-up does not masquerade as a final answer")
+
+
+def test_max_iterations_falls_back_to_synthetic_summary_on_llm_error():
+    """If the summary call fails, still end cleanly with a useful message."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+    from app.agent.agent import MAX_ITERATIONS
+
+    calls = {"n": 0}
+    tool_call = _usage_response(_tool_call("read_file", path="x.py"), 10, 1)
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > MAX_ITERATIONS:
+            raise RuntimeError("endpoint down")
+        # Vary the path so loop detection does not trip.
+        return _usage_response(_tool_call("read_file", path=f"f{calls['n']}.py"), 10, 1)
+
+    with patch.object(A, "chat", side_effect=flaky), \
+         patch.object(A.Agent, "_execute_tool", lambda self, n, a: "ok"):
+        agent = Agent()
+        events = list(agent.step("find the parser"))
+
+    last = events[-1]
+    assert last.type == "max_iterations_reached", f"got {last.type}"
+    assert "Stopped after" in last.message, last.message
+    assert "read_file" in last.message, last.message
+    print("  PASS: summary-call failure degrades to a synthetic summary")
+
+
+def test_gave_up_turn_renders_no_success_panel():
+    """_render_turn_summary must stay silent when the turn gave up."""
+    import app.main as _main
+    from app.agent import AgentEvent
+    from app.ui.console import console as ui_console
+    from app.ui.toolfeed import ToolFeed
+
+    _main.reset_turn()
+    _main._turn["tools"] = 15
+    _main._turn["changed"] = ["app/tools/scratch.txt"]
+
+    with ui_console.capture() as cap:
+        _main.render_event(
+            AgentEvent(type="max_iterations_reached", message="Ran out of iterations."),
+            ToolFeed(),
+        )
+        _main._render_turn_summary("Ran out of iterations.")
+    out = cap.get()
+
+    assert "Task completed" not in out, "gave-up turn rendered a success panel"
+    assert "Stopped without finishing" in out, out
+    assert _main._turn["gave_up"] is True
+    _main.reset_turn()
+    print("  PASS: no success panel on a gave-up turn")
+
+
+# ── Leaked chain-of-thought ─────────────────────────────────────────
+
+_LEAKED_GREETING = (
+    'We need to respond. No tool calls needed just a greeting. But we must '
+    'follow behavior: direct and decisive, no preamble. Probably just "Hello". '
+    'However maybe they expect something else. Since user said "HI", respond '
+    'with greeting.\nHello'
+)
+
+
+def test_regress_leaked_reasoning_stripped_from_final_answer():
+    """Deliberation written into the content channel must not reach the user."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    with patch.object(A, "chat", return_value=_usage_response(_LEAKED_GREETING, 10, 5)):
+        agent = Agent()
+        events = list(agent.step("HI"))
+
+    assert events[-1].message == "Hello", f"leaked reasoning shown: {events[-1].message!r}"
+
+    # And it must not be stored either, or later turns re-read it as a
+    # prior real answer and the leak compounds.
+    stored = [m for m in agent.history if m["role"] == "assistant"][-1]["content"]
+    assert stored == "Hello", f"leaked reasoning stored in history: {stored!r}"
+    print("  PASS: leaked reasoning stripped from the final answer")
+
+
+def test_strip_leaked_reasoning_preserves_real_multiparagraph_answers():
+    """The false-positive guard — it matters more than catching every leak."""
+    from app.agent.agent import _strip_leaked_reasoning
+
+    genuine = [
+        # Hedging connectives are ordinary prose, not deliberation.
+        "Since the file is large, I only read the first 500 lines.\n"
+        "The parser lives in app/tools/search.py.",
+        "So the total is 42 files.\nThey are spread across six packages.",
+        "However you configure it, the parser stays the same.\n"
+        "Use search_code to find it.",
+        # Genuine two-paragraph explanation.
+        "The agent loop calls the LLM, parses tool calls, and executes them.\n\n"
+        "Each result is fed back as a tool message before the next call.",
+        # Lead-in followed by a list.
+        "Based on the code, there are three issues.\n"
+        "- Missing validation\n- No retry\n- Silent failure",
+    ]
+    for text in genuine:
+        assert _strip_leaked_reasoning(text) == text, \
+            f"genuine answer was truncated: {text!r}"
+    print("  PASS: genuine multi-paragraph answers pass through unchanged")
+
+
+def test_think_block_stripped_from_content():
+    """A leaked </think> block is an exact delimiter — strip it precisely."""
+    from app.agent.agent import _strip_think_blocks
+
+    leaked = (
+        'We have user just says "HI". We should respond concisely.\n'
+        "Thus final answer: Hello!\n"
+        "</think>\n"
+        "Hello! How can I assist you today?"
+    )
+    assert _strip_think_blocks(leaked) == "Hello! How can I assist you today?"
+
+    # Paired form.
+    assert _strip_think_blocks("<think>musing</think>The answer is 42.") == "The answer is 42."
+
+    # A tool call after the think block must survive intact.
+    with_call = (
+        'We need to look around.\n</think>\n'
+        '<tool_call>\n{"name": "list_files", "arguments": {"path": "."}}\n</tool_call>'
+    )
+    assert "list_files" in _strip_think_blocks(with_call)
+    assert "We need to look around" not in _strip_think_blocks(with_call)
+
+    # Untagged text is untouched.
+    plain = "No think tags here at all."
+    assert _strip_think_blocks(plain) == plain
+    print("  PASS: leaked <think> blocks stripped from content")
+
+
+def test_leaked_think_block_does_not_reach_the_user():
+    """End-to-end: the observed nemotron shape must render as the answer only."""
+    from unittest.mock import patch
+    import app.agent.agent as A
+
+    leaked = (
+        'We have user just says "HI". According to behavior, we should just do work.\n'
+        "Thus final answer: Hello! How can I assist you today?\n"
+        "</think>\n"
+        "Hello! How can I assist you today?"
+    )
+    with patch.object(A, "chat", return_value=_usage_response(leaked, 10, 5)):
+        agent = Agent()
+        events = list(agent.step("HI"))
+
+    assert events[-1].message == "Hello! How can I assist you today?", events[-1].message
+    stored = [m for m in agent.history if m["role"] == "assistant"][-1]["content"]
+    assert "We have user just says" not in stored, stored
+    print("  PASS: think-block leak never reaches the user or history")
+
+
+def test_strip_leaked_reasoning_noop_on_single_paragraph():
+    from app.agent.agent import _strip_leaked_reasoning
+
+    for text in [
+        "Hello",
+        "We need to respond with a greeting so here it is.",
+        "The parser lives in app/tools/search.py and handles regex search.",
+    ]:
+        assert _strip_leaked_reasoning(text) == text, text
+    print("  PASS: single-paragraph text passes through unchanged")
+
+
+def test_strip_leaked_reasoning_noop_when_preamble_incomplete():
+    """If the LAST part is also deliberation, there is no clean answer to keep."""
+    from app.agent.agent import _strip_leaked_reasoning
+
+    all_deliberation = (
+        "We need to check the config first.\n\n"
+        "We should probably read the file before deciding."
+    )
+    assert _strip_leaked_reasoning(all_deliberation) == all_deliberation
+
+    mixed = (
+        "The config lives in .env.\n\n"
+        "We need to read it before answering."
+    )
+    assert _strip_leaked_reasoning(mixed) == mixed
+    print("  PASS: no strip when the split is ambiguous")
+
+
+def test_token_usage_captured():
+    """Test that token usage is captured from LLM response."""
+    from unittest.mock import patch, MagicMock
+
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = "Hello."
+    mock_resp.usage = MagicMock()
+    mock_resp.usage.prompt_tokens = 100
+    mock_resp.usage.completion_tokens = 20
+    mock_resp.usage.total_tokens = 120
+
+    with patch("app.agent.agent.chat", return_value=mock_resp):
+        agent = Agent()
+        list(agent.step("hi"))
+
+    assert agent.input_tokens == 100
+    assert agent.output_tokens == 20
+    assert agent.total_tokens == 120
+
+    print("  PASS: token usage captured")
+
+
+def test_history_cap():
+    """Test that history is capped to prevent context overflow."""
+    from unittest.mock import patch, MagicMock
+    from app.agent.agent import _HISTORY_CAP
+
+    # Simulate many tool calls by directly appending to history
+    agent = Agent()
+    initial_len = len(agent.history)
+
+    # Manually grow history beyond cap
+    for i in range(_HISTORY_CAP + 20):
+        agent.history.append({"role": "assistant", "content": f"msg {i}"})
+        agent.history.append({"role": "tool", "tool_call_id": f"c{i}", "content": f"result {i}"})
+
+    assert len(agent.history) > _HISTORY_CAP + 1
+
+    # Call _cap_history
+    agent._cap_history()
+
+    # Should be capped to system + _HISTORY_CAP messages
+    assert len(agent.history) == _HISTORY_CAP + 1
+    # System prompt always preserved
+    assert agent.history[0]["role"] == "system"
+    # Most recent messages preserved
+    assert agent.history[-1]["content"] == f"result {_HISTORY_CAP + 19}"
+
+    print("  PASS: history cap")
+
+
+def test_final_response_terminates_step():
+    """Test that Agent.step() terminates after final response (no tool calls)."""
+    from unittest.mock import patch, MagicMock
+
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = "Task complete."
+
+    with patch("app.agent.agent.chat", return_value=mock_resp):
+        agent = Agent()
+        events = list(agent.step("do something"))
+
+    # Should yield exactly one event: the final response
+    assert len(events) == 1
+    assert events[0].type == "agent_message"
+    assert events[0].message == "Task complete."
+    # History should have: system + user + assistant (3 messages)
+    assert len(agent.history) == 3
+
+    print("  PASS: final response terminates step")
+
+
 if __name__ == "__main__":
     print("Running VektorCode end-to-end tests...\n")
 
@@ -741,7 +1376,7 @@ if __name__ == "__main__":
         test_search_code,
         test_path_traversal_blocked,
         test_destructive_command,
-        test_destructive_command_confirm,
+        test_permission_gate,
         test_destructive_patterns,
         test_agent_tool_loop,
         test_agent_max_iterations,
@@ -768,6 +1403,29 @@ if __name__ == "__main__":
         test_tool_result_field_fix,
         test_tools_command_registry,
         test_agent_emits_tool_events,
+        test_read_file_truncation,
+        test_truncate_only_targets_tool_role,
+        test_tool_protocol_stripped_from_history,
+        test_regress_token_usage_cumulative_across_tool_chain,
+    test_token_usage_ignores_non_numeric_mock_usage,
+    test_cost_estimate_zero_for_local_models,
+    test_cost_estimate_env_override,
+    test_budget_tracker_blocks_over_budget,
+    test_agent_stops_when_daily_budget_exhausted,
+    test_task_log_written_with_expected_fields,
+    test_max_iterations_asks_model_for_real_summary,
+    test_max_iterations_event_is_not_agent_message,
+    test_max_iterations_falls_back_to_synthetic_summary_on_llm_error,
+    test_gave_up_turn_renders_no_success_panel,
+    test_regress_leaked_reasoning_stripped_from_final_answer,
+    test_strip_leaked_reasoning_preserves_real_multiparagraph_answers,
+    test_think_block_stripped_from_content,
+    test_leaked_think_block_does_not_reach_the_user,
+    test_strip_leaked_reasoning_noop_on_single_paragraph,
+    test_strip_leaked_reasoning_noop_when_preamble_incomplete,
+    test_token_usage_captured,
+        test_history_cap,
+        test_final_response_terminates_step,
     ]
 
     passed = 0

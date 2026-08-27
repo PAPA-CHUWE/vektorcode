@@ -49,6 +49,10 @@ def _build_registry() -> tuple[list[CommandMeta], dict[str, Callable[..., Any]]]
         CommandMeta("/workspace", "Show current workspace path"),
         CommandMeta("/tools",     "Show available tools"),
         CommandMeta("/clear",     "Clear conversation history"),
+        CommandMeta("/tokens",    "Toggle token counts in the status bar"),
+        CommandMeta("/queue",     "List queued messages (clear | pop)"),
+        CommandMeta("/mode",      "Show or set permission mode (shift+tab cycles)"),
+        CommandMeta("/trace",     "Show the full traceback for the last error"),
         CommandMeta("/reload",    "Reload configuration from .env"),
         CommandMeta("/exit",      "Exit VektorCode"),
     ]

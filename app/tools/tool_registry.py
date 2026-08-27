@@ -274,11 +274,6 @@ def _register_builtin_tools(registry: ToolRegistry) -> None:
                     "description": "Working directory",
                     "default": ".",
                 },
-                "confirm": {
-                    "type": "boolean",
-                    "description": "Confirm destructive commands",
-                    "default": False,
-                },
             },
             "required": ["command"],
         },

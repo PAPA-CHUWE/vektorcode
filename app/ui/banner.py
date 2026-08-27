@@ -32,7 +32,7 @@ def show_banner(model: str = "", workspace: str = "") -> None:
     lines.append("                ● Status: READY\n", style="green")
     lines.append("\n")
     lines.append("                   Type ", style="dim")
-    lines.append("/help", style="bold gold")
+    lines.append("/help", style="gold")
     lines.append(" for commands\n", style="dim")
     lines.append("\n")
 

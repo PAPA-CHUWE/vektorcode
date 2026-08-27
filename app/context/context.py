@@ -82,9 +82,43 @@ _MODEL_CONFIGS: dict[str, ModelConfig] = {
 
 
 def get_model_config(model_name: str | None = None) -> ModelConfig:
-    """Get context configuration for a model. Falls back to a safe default."""
+    """Get context configuration for a model.
+
+    Resolution order:
+    1. Exact match in _MODEL_CONFIGS
+    2. LITELLM_CONTEXT_WINDOW env override (explicit escape hatch)
+    3. Longest known-key prefix match — deployment names carry suffixes
+       ("nemotron-3-super", "qwen2.5-coder-32b"), and an exact-only lookup
+       silently assigned them the 32K default, forcing needless compaction.
+    4. Safe 32K default
+    """
     name = model_name or os.getenv("LITELLM_MODEL", "qwen")
-    return _MODEL_CONFIGS.get(name, ModelConfig(name=name))
+
+    exact = _MODEL_CONFIGS.get(name)
+    if exact is not None:
+        return exact
+
+    override = os.getenv("LITELLM_CONTEXT_WINDOW", "").strip()
+    if override.isdigit() and int(override) > 0:
+        window = int(override)
+        return ModelConfig(
+            name=name,
+            context_window=window,
+            max_output_tokens=min(8192, max(1024, window // 8)),
+        )
+
+    lowered = name.lower()
+    candidates = [k for k in _MODEL_CONFIGS if lowered.startswith(k.lower())]
+    if candidates:
+        best = max(candidates, key=len)
+        return ModelConfig(
+            name=name,
+            context_window=_MODEL_CONFIGS[best].context_window,
+            max_output_tokens=_MODEL_CONFIGS[best].max_output_tokens,
+            safety_margin=_MODEL_CONFIGS[best].safety_margin,
+        )
+
+    return ModelConfig(name=name)
 
 
 # ── Context Budget ──────────────────────────────────────────────────
@@ -178,7 +212,7 @@ def compact_history(
     remaining = result[1:] if len(result) > 1 else []
 
     # Phase 1: Truncate large tool results in-place
-    remaining = _truncate_tool_outputs(remaining, max_output_chars=2000)
+    remaining = _truncate_tool_outputs(remaining, max_output_chars=2000, preserve_recent=2)
 
     # Phase 2: If still over budget, remove oldest messages (keep system + last user)
     if estimate_messages_tokens([system_msg] + remaining) > target_tokens and len(remaining) > 2:
@@ -216,20 +250,54 @@ def compact_history(
     return final
 
 
+# A preserved (recent) tool result is still capped, but generously — enough
+# for a full ~500-line source file. Without this, a single huge result could
+# still overflow the window.
+PRESERVE_HARD_CAP_CHARS = 24000
+
+
 def _truncate_tool_outputs(
     messages: list[dict[str, Any]],
     max_output_chars: int = 2000,
+    preserve_recent: int = 0,
 ) -> list[dict[str, Any]]:
-    """Truncate large tool results in assistant messages to save context."""
+    """Truncate large tool results to save context.
+
+    Only targets role:"tool" messages — never truncates assistant
+    or user messages, as those contain reasoning and instructions.
+
+    The most recent ``preserve_recent`` tool results are kept intact
+    (up to PRESERVE_HARD_CAP_CHARS). Truncating the result the model
+    just asked for makes it re-request the same data — it never sees
+    the output it requested, so it pages through the file forever.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    protected = set(tool_indices[-preserve_recent:]) if preserve_recent > 0 else set()
+
     result = []
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str) and len(content) > max_output_chars:
-            # Keep first portion + truncation notice
-            truncated = content[:max_output_chars] + f"\n\n[... truncated — {len(content) - max_output_chars} chars]"
-            result.append({**msg, "content": truncated})
-        else:
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "tool":
             result.append(msg)
+            continue
+
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            result.append(msg)
+            continue
+
+        limit = PRESERVE_HARD_CAP_CHARS if i in protected else max_output_chars
+        if len(content) <= limit:
+            result.append(msg)
+            continue
+
+        dropped = len(content) - limit
+        truncated = (
+            content[:limit]
+            + f"\n\n[... truncated — {dropped} chars omitted from this tool result. "
+            f"Do NOT re-request the same data; use search_code to locate specific "
+            f"content instead.]"
+        )
+        result.append({**msg, "content": truncated})
     return result
 
 
@@ -274,7 +342,7 @@ class ContextManager:
 
         if report.is_warning:
             # Light compaction — truncate tool outputs only
-            compacted = _truncate_tool_outputs(messages, max_output_chars=3000)
+            compacted = _truncate_tool_outputs(messages, max_output_chars=3000, preserve_recent=2)
             return compacted
 
         return messages

@@ -21,6 +21,15 @@ def _get_client() -> OpenAI:
     return OpenAI(api_key=api_key, base_url=get_endpoint())
 
 
+# Generation is halted at the end of the first tool call. Without this the
+# model keeps writing past its own <tool_call> and fabricates <tool_output>
+# blocks — role-playing both sides of the conversation. It then acts on
+# invented results, and re-requests the same data once real results arrive.
+TOOL_CALL_STOP = "</tool_call>"
+
+MAX_OUTPUT_TOKENS = 4096
+
+
 def chat(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -30,6 +39,8 @@ def chat(
     kwargs: dict[str, Any] = {
         "model": model or get_model(),
         "messages": messages,
+        "stop": [TOOL_CALL_STOP],
+        "max_tokens": MAX_OUTPUT_TOKENS,
     }
     if tools:
         kwargs["tools"] = tools

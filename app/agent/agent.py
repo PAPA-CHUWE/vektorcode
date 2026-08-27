@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from app.config import get_workspace
+from app.config import get_model, get_workspace
 from app.context import ContextManager
+from app.cost import BudgetTracker, TaskLogger, estimate_cost
 from app.llm import chat
 from app.tools import get_registry, get_event_bus
 from app.tools.events import ToolEvent, ToolEventType
@@ -32,6 +32,7 @@ from app.tools.tool_result import ToolStatus
 
 MAX_ITERATIONS = 15
 _REPEAT_THRESHOLD = 3
+_HISTORY_CAP = 40  # max messages in history (system + conversation window)
 
 logger = logging.getLogger("vektorcode.agent")
 
@@ -50,6 +51,14 @@ BEHAVIOR RULES — FOLLOW THESE EXACTLY:
 - Start working immediately. No preamble, no "Sure!", no "I'd be happy to help". Just do the work.
 - When done, give a concise result. One or two sentences max for simple tasks.
 
+INVESTIGATION STYLE:
+- Investigate efficiently, then finish the task. Take as many tool calls as the
+  task genuinely needs — there is no fixed budget, and you must not stop early
+  or ration calls.
+- Prefer search_code over reading files one by one to explore.
+- Do NOT call a tool twice with identical arguments; you already have that result.
+- Every tool result you receive is real. Never invent or predict tool output.
+
 You have access to tools for:
 - inspecting files
 - reading source code
@@ -64,7 +73,7 @@ Available tools:
 2. read_file(path="file.txt") → read file contents
 3. write_file(path="file.txt", content="...") → write content to file
 4. search_code(pattern="regex", path=".", include="*.py") → search file contents (like grep)
-5. run_command(command="ls -la", working_directory=".", confirm=false) → run shell command
+5. run_command(command="ls -la", working_directory=".") → run shell command
 6. get_config() → show current model, endpoint, API key status
 
 To use a tool, output EXACTLY this format (one call per block):
@@ -90,7 +99,9 @@ TOOL USAGE RULES:
 - Run tests or validation after changes.
 - Do not modify unrelated files.
 - Do not claim something works unless you validated it.
-- Ask for confirmation before destructive operations (rm, git reset --hard, etc.).
+- Destructive operations (rm, git reset --hard) are gated by the permission
+  layer, which asks the user directly. You cannot approve them yourself; if
+  one is declined, report that and move on.
 """
 
 TOOL_CALL_PATTERN = re.compile(
@@ -127,6 +138,53 @@ class AgentEvent:
     message: str = ""
 
 
+def _escape_raw_control_chars(text: str) -> str:
+    """Escape literal newlines/tabs that appear inside JSON string values.
+
+    JSON forbids raw control characters inside strings, but a model writing
+    a multi-line file almost always emits them anyway:
+
+        {"name": "write_file", "arguments": {"content": "line one
+        line two"}}
+
+    Without this the object fails to parse, the caller falls back to empty
+    arguments, and write_file is dispatched with no path or content.
+    """
+    out: list[str] = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            out.append(ch)
+            escape = False
+            continue
+        if ch == "\\" and in_string:
+            out.append(ch)
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            continue
+        if in_string and ch in "\n\r\t":
+            out.append({"\n": "\\n", "\r": "\\r", "\t": "\\t"}[ch])
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _loads_relaxed(raw: str) -> dict[str, Any] | None:
+    """json.loads, retrying once with raw control characters escaped."""
+    for candidate in (raw, _escape_raw_control_chars(raw)):
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
 def _extract_json_from_tags(text: str) -> list[dict[str, Any]]:
     """Extract JSON objects from <tool_call>...</tool_call> blocks.
 
@@ -144,33 +202,30 @@ def _extract_json_from_tags(text: str) -> list[dict[str, Any]]:
             break
         content_start = start + len(tag_start)
 
-        # Find the matching </  tag by brace-matching the JSON
+        # Find the matching closing tag. It may be absent: the LLM stop
+        # sequence is "</tool_call>", so the provider strips it from the
+        # response. Treat the remainder of the text as the call body.
         end = text.find(tag_end, content_start)
         if end == -1:
-            break
+            raw = text[content_start:].strip()
+            search_from = len(text)
+        else:
+            raw = text[content_start:end].strip()
+            search_from = end + len(tag_end)
 
-        raw = text[content_start:end].strip()
-        search_from = end + len(tag_end)
-
-        # Try direct JSON parse first
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict) and "name" in parsed:
-                calls.append(parsed)
-                continue
-        except json.JSONDecodeError:
-            pass
+        # Try direct JSON parse first (relaxed: tolerates raw newlines)
+        parsed = _loads_relaxed(raw)
+        if parsed is not None and "name" in parsed:
+            calls.append(parsed)
+            continue
 
         # Try brace-matching to find the JSON object boundary
         json_obj = _extract_balanced_json(raw)
         if json_obj is not None:
-            try:
-                parsed = json.loads(json_obj)
-                if isinstance(parsed, dict) and "name" in parsed:
-                    calls.append(parsed)
-                    continue
-            except json.JSONDecodeError:
-                pass
+            parsed = _loads_relaxed(json_obj)
+            if parsed is not None and "name" in parsed:
+                calls.append(parsed)
+                continue
 
         # Fallback: regex for {"name": ..., "arguments": ...}
         m = re.search(r'\{\s*"name"\s*:\s*"(\w+)"', raw)
@@ -178,13 +233,18 @@ def _extract_json_from_tags(text: str) -> list[dict[str, Any]]:
             name = m.group(1)
             # Try to extract arguments object
             args_match = re.search(r'"arguments"\s*:\s*(\{.*\})', raw, re.DOTALL)
-            args: dict[str, Any] = {}
+            args: dict[str, Any] | None = None
             if args_match:
-                try:
-                    args = json.loads(args_match.group(1))
-                except json.JSONDecodeError:
-                    pass
-            calls.append({"name": name, "arguments": args})
+                args = _loads_relaxed(args_match.group(1))
+
+            if args is None:
+                # Arguments were present but unrecoverable — usually a
+                # truncated write_file. Dispatching with {} produced a
+                # baffling "missing 2 required positional arguments"; flag
+                # it instead so the model is told to resend the call.
+                calls.append({"name": name, "arguments": {}, "_malformed": True})
+            else:
+                calls.append({"name": name, "arguments": args})
 
     return calls
 
@@ -254,6 +314,125 @@ def _extract_bare_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+# Openers that mark planning-aloud rather than an answer. Reasoning models
+# sometimes leak their analysis channel into content: they narrate the call
+# they are about to make, then emit no <tool_call> at all. A real answer
+# addresses the user ("4", "Hello! How can I help?") and never opens this way,
+# so the voice — not the length alone — is what separates the two.
+_DELIBERATION_OPENERS = (
+    "we need", "we should", "we must", "we will", "we'll", "we have",
+    "we can", "we've", "let's", "let me", "now we", "first we", "next we",
+    "i need to", "i should", "i'll",
+)
+
+# Deliberation is terse; a genuine answer that opens this way is longer.
+_ABANDONED_MAX_CHARS = 200
+
+
+# What actually distinguishes leaked deliberation from prose is the model
+# talking to itself, not hedging words. Generic connectives ("so", "since",
+# "however", "therefore") are everywhere in ordinary answers — keying on them
+# truncated real content like "Since the file is large, I only read the first
+# 500 lines." and "So the total is 42 files.", losing a caveat and an answer.
+_REASONING_MARKERS = _DELIBERATION_OPENERS + (
+    "we can just", "we could", "we might", "maybe we", "perhaps we",
+    "i should probably", "the user wants", "the user said",
+    "the user asked", "user wants", "user said",
+)
+
+
+def _looks_like_deliberation(paragraph: str) -> bool:
+    """True if a paragraph is the model reasoning at itself.
+
+    Requires a first-person planning phrase somewhere in the paragraph. A
+    hedging connective on its own is not evidence.
+    """
+    lowered = paragraph.lower()
+    return any(
+        lowered.startswith(marker) or f" {marker}" in lowered
+        for marker in _REASONING_MARKERS
+    )
+
+
+_THINK_PAIR_RE = re.compile(r"<think\s*>.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_UPTO_CLOSE_RE = re.compile(r"^.*?</think\s*>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove a leaked <think> block from the content channel.
+
+    Reasoning models (nemotron here) sometimes write their thinking into
+    content instead of reasoning_content, terminated by a literal </think>.
+    That tag is an exact delimiter — everything up to and including it is
+    deliberation — which beats guessing from sentence shape.
+    """
+    cleaned = _THINK_PAIR_RE.sub("", text)
+    # A stray closing tag with no opener: the whole prefix was the think block.
+    if "</think" in cleaned.lower():
+        cleaned = _THINK_UPTO_CLOSE_RE.sub("", cleaned, count=1)
+    return cleaned.strip()
+
+
+def _strip_leaked_reasoning(text: str) -> str:
+    """Strip a leaked deliberation preamble from a final answer.
+
+    When text looks like [deliberation paragraph(s)] followed by [a final
+    part that isn't deliberation], keep only the final part. Returns the
+    text UNCHANGED whenever the split is ambiguous — occasionally showing
+    leaked reasoning beats truncating a genuine answer.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paragraphs) < 2:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        if len(lines) < 2:
+            return text
+        paragraphs = lines
+
+    last = paragraphs[-1]
+    preamble = paragraphs[:-1]
+
+    # Only strip when EVERY preceding paragraph reads as deliberation and the
+    # final one does not. A real multi-paragraph answer won't satisfy this.
+    if (
+        preamble
+        and all(_looks_like_deliberation(p) for p in preamble)
+        and not _looks_like_deliberation(last)
+    ):
+        return last
+    return text
+
+
+def _is_abandoned_turn(text: str) -> bool:
+    """True if a reply is planning-aloud with no tool call — not an answer."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if len(stripped) >= _ABANDONED_MAX_CHARS:
+        return False
+    return stripped.lower().startswith(_DELIBERATION_OPENERS)
+
+
+def _safe_int(value: Any) -> int:
+    """Coerce a token-usage field to int, defaulting to 0.
+
+    Deliberately not ``int(value)``: MagicMock defines __int__, so a mocked
+    or absent usage object would silently coerce to 1 and fabricate token
+    counts. Only real numeric types are trusted.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
 def _call_signature(name: str, args: dict[str, Any]) -> str:
     """Create a normalized signature for a tool call.
 
@@ -281,12 +460,31 @@ class Agent:
             {"role": "system", "content": system_prompt}
         ]
         self.total_tokens: int = 0
+        self.input_tokens: int = 0
+        self.output_tokens: int = 0
         self.context_manager = ContextManager()
+        self.session_cost_usd: float = 0.0
+        self.budget = BudgetTracker()
+        self.budget.load_today(get_workspace() / "logs")
+        # Status of the most recent tool execution, set by _execute_tool.
+        self._last_tool_status: ToolStatus | None = None
 
     def clear_history(self) -> None:
         """Reset conversation to just the system prompt."""
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(workspace=str(get_workspace()))
         self.history = [{"role": "system", "content": system_prompt}]
+
+    def _cap_history(self) -> None:
+        """Trim history to prevent context overflow.
+
+        Keeps: system prompt (index 0) + last _HISTORY_CAP messages.
+        Called after every tool result to prevent unbounded growth.
+        """
+        if len(self.history) <= _HISTORY_CAP + 1:
+            return
+        system = self.history[0]
+        recent = self.history[-(_HISTORY_CAP):]
+        self.history = [system] + recent
 
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool via the registry and emit ToolEvents."""
@@ -312,6 +510,7 @@ class Agent:
         else:
             event_bus.emit(ToolEvent.completed(name, category, duration))
 
+        self._last_tool_status = result.status
         return str(result)
 
     def _extract_tool_calls(self, text: str) -> list[dict[str, Any]]:
@@ -398,9 +597,47 @@ class Agent:
 
         # Loop detection: track recent tool call signatures
         recent_signatures: list[str] = []
+        consecutive_loops = 0
+        empty_responses = 0
         last_tool_name: str = ""
 
+        # Per-turn accounting. A turn makes several LLM calls, so usage is
+        # summed here and published to the public attributes exactly once,
+        # at whichever exit this turn takes.
+        model_name = get_model()
+        task_logger = TaskLogger(get_workspace() / "logs")
+        turn_input_tokens = 0
+        turn_output_tokens = 0
+        turn_total_tokens = 0
+        turn_cost_usd = 0.0
+
+        def _finalize(result_text: str, had_error: bool) -> None:
+            self.input_tokens = turn_input_tokens
+            self.output_tokens = turn_output_tokens
+            self.total_tokens = turn_total_tokens
+            task_logger.finalize(
+                task=user_message,
+                model=model_name,
+                input_tokens=turn_input_tokens,
+                output_tokens=turn_output_tokens,
+                cost_usd=turn_cost_usd,
+                result=result_text,
+                had_error=had_error,
+            )
+
         for iteration in range(MAX_ITERATIONS):
+            # ── Pre-flight budget gate ──────────────────────────────
+            if self.budget.would_exceed(0.0):
+                msg = (
+                    f"Daily budget exceeded: ${self.budget.spent_today_usd:.4f} of "
+                    f"${self.budget.daily_budget_usd:.2f} already spent today. "
+                    "Refusing further model calls until the budget resets."
+                )
+                self.history.append({"role": "assistant", "content": msg})
+                _finalize(msg, had_error=True)
+                yield AgentEvent(type="error", message=msg)
+                return
+
             # Prepare safe messages for the LLM
             safe_messages = self.context_manager.prepare_messages(self.history)
 
@@ -410,32 +647,101 @@ class Agent:
                 msg = f"Error: could not reach LLM — {exc}"
                 self.history.append({"role": "assistant", "content": msg})
                 self._log_cycle(iteration, final=True)
+                task_logger.errors.append(msg)
+                _finalize(msg, had_error=True)
                 yield AgentEvent(type="error", message=msg)
                 return
 
-            text = response.choices[0].message.content or ""
-            tool_calls = self._extract_tool_calls(text)
+            message = response.choices[0].message
+            text = _strip_think_blocks(message.content or "")
+            reasoning = getattr(message, "reasoning_content", None) or ""
+
+            tool_calls = self._extract_tool_calls(text) if text.strip() else []
+
+            # Reasoning models (gpt-oss, nemotron) frequently emit an empty
+            # content channel. If the tool call landed in reasoning_content,
+            # recover it — but never present raw chain-of-thought to the user
+            # as a final answer, so reasoning is used for dispatch only.
+            if not tool_calls and not text.strip() and reasoning.strip():
+                recovered = self._extract_tool_calls(reasoning)
+                if recovered:
+                    tool_calls = recovered
+                    text = reasoning
+
+            # Accumulate token usage across the whole turn. Overwriting here
+            # reported only the final call and undercounted multi-step turns.
+            usage = getattr(response, "usage", None)
+            call_input_tokens = _safe_int(getattr(usage, "prompt_tokens", 0)) if usage else 0
+            call_output_tokens = _safe_int(getattr(usage, "completion_tokens", 0)) if usage else 0
+            call_total_tokens = _safe_int(getattr(usage, "total_tokens", 0)) if usage else 0
+            if not call_total_tokens:
+                call_total_tokens = call_input_tokens + call_output_tokens
+
+            turn_input_tokens += call_input_tokens
+            turn_output_tokens += call_output_tokens
+            turn_total_tokens += call_total_tokens
+
+            call_cost_usd = estimate_cost(model_name, call_input_tokens, call_output_tokens)
+            turn_cost_usd += call_cost_usd
+            self.session_cost_usd += call_cost_usd
+            self.budget.record(call_cost_usd)
+
+            # This deployment intermittently drops the tool call: the model
+            # deliberates in the reasoning channel and emits either nothing or
+            # bare thinking-aloud into content, with no <tool_call> block. That
+            # is not a final answer, so nudge rather than reporting it as one.
+            # Deliberation can surface in either channel, so check both. The
+            # length bound is what separates "thinking aloud about a call" from
+            # a real answer that happens to mention a tool by name; a genuine
+            # answer to a real question is not this short.
+            intended_tool = not tool_calls and _is_abandoned_turn(text)
+
+            # ── Empty / abandoned turn → nudge once, never report as answer ──
+            if not tool_calls and (not text.strip() or intended_tool):
+                empty_responses += 1
+                if empty_responses >= 3:
+                    msg = (
+                        "Error: the model failed to emit a tool call 3 times in a row "
+                        "(it reasoned about calling one but produced no <tool_call> "
+                        "block). Try rephrasing, or switch models with /model."
+                    )
+                    self.history.append({"role": "assistant", "content": msg})
+                    task_logger.errors.append(msg)
+                    _finalize(msg, had_error=True)
+                    yield AgentEvent(type="error", message=msg)
+                    return
+                self.history.append({
+                    "role": "user",
+                    "content": "Your last reply contained no <tool_call> block and no "
+                               "final answer. Reply now with either a literal "
+                               "<tool_call> block or your final answer.",
+                })
+                continue
 
             # ── No tool calls → final response → STOP ──────────────
             if not tool_calls:
-                self.history.append({"role": "assistant", "content": text})
+                # Strip any leaked protocol markup from final response
+                clean = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
+                # Store the stripped version: otherwise later turns re-read the
+                # model's own leaked deliberation as a prior real answer.
+                clean = _strip_leaked_reasoning(clean)
+                self.history.append({"role": "assistant", "content": clean})
                 self._log_cycle(iteration, final=True)
-                yield AgentEvent(type="agent_message", message=text)
+                _finalize(clean, had_error=False)
+                yield AgentEvent(type="agent_message", message=clean)
                 return
 
             # ── Tool call(s) found → execute first one only ─────────
-            self.history.append({"role": "assistant", "content": text})
-
-            # Yield thinking text (text before the tool call block)
-            thinking = text
+            # Strip <tool_call> protocol markup from assistant message
+            clean_text = text
             for tc in tool_calls:
                 name = tc.get("name", "")
                 args_str = json.dumps(tc.get("arguments", {}), ensure_ascii=False)
                 block = f'<tool_call>\n{{"name": "{name}", "arguments": {args_str}}}\n</tool_call>'
-                thinking = thinking.replace(block, "").replace("<tool_call>", "").replace("</tool_call>", "")
-            thinking = thinking.strip()
-            if thinking:
-                yield AgentEvent(type="agent_message", message=thinking)
+                clean_text = clean_text.replace(block, "")
+            clean_text = re.sub(r"<tool_call>.*?</tool_call>", "", clean_text, flags=re.DOTALL).strip()
+
+            self.history.append({"role": "assistant", "content": clean_text or "(tool call)"})
 
             # Execute only the first tool call
             call = tool_calls[0]
@@ -444,19 +750,55 @@ class Agent:
             target = self._tool_target(name, args)
             last_tool_name = name
 
+            # ── Unparseable arguments → ask for a resend ────────────
+            if call.get("_malformed"):
+                malformed_msg = (
+                    f"Your {name} call could not be parsed — the arguments were "
+                    "incomplete or invalid JSON. Resend the whole <tool_call> "
+                    "block with valid JSON, escaping newlines in string values "
+                    "as \\n."
+                )
+                self._log_cycle(iteration, tool_call=name, result_status="error")
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": f"malformed_{iteration}",
+                    "content": malformed_msg,
+                })
+                task_logger.errors.append(f"{name}: unparseable arguments")
+                self._cap_history()
+                continue
+
             # ── Loop detection ──────────────────────────────────────
             sig = _call_signature(name, args)
 
             if recent_signatures and sig == recent_signatures[-1]:
+                consecutive_loops += 1
                 loop_msg = (
                     f"Loop detected: {name} called repeatedly "
-                    f"with identical arguments. Stopping to prevent infinite loop."
+                    f"with identical arguments."
                 )
                 self._log_cycle(iteration, tool_call=name, loop_detected=True)
-                self.history.append({"role": "assistant", "content": loop_msg})
-                yield AgentEvent(type="error", message=loop_msg)
-                return
 
+                # Force stop after 3 consecutive loops — model is stuck
+                if consecutive_loops >= 3:
+                    stop_msg = f"Agent stopped: {loop_msg} Giving up after {consecutive_loops} attempts."
+                    self.history.append({"role": "assistant", "content": stop_msg})
+                    task_logger.errors.append(stop_msg)
+                    _finalize(stop_msg, had_error=True)
+                    yield AgentEvent(type="error", message=stop_msg)
+                    return
+
+                # Send feedback so model can try a different approach
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": f"loop_{iteration}",
+                    "content": f"BLOCKED: {loop_msg} Do NOT call {name} again with these arguments. Respond with a final answer or try a different tool.",
+                })
+                self._cap_history()
+                continue
+
+            consecutive_loops = 0  # reset on successful different call
+            empty_responses = 0    # model produced a usable turn
             recent_signatures.append(sig)
             if len(recent_signatures) > _REPEAT_THRESHOLD:
                 recent_signatures = recent_signatures[-_REPEAT_THRESHOLD:]
@@ -473,11 +815,22 @@ class Agent:
 
             result = self._execute_tool(name, args)
 
-            is_error = result.startswith("Error:")
-            is_blocked = "BLOCKED" in result
+            # Classify from the tool's own status, never by searching the
+            # output text: reading a file that merely contains the word
+            # "BLOCKED" (agent.py does, in its loop-detection message) would
+            # otherwise render the whole file as a blocked-command error.
+            status = self._last_tool_status
+            self._last_tool_status = None
+            if status is None:
+                is_error = result.startswith("Error:")
+                is_blocked = False
+            else:
+                is_error = status == ToolStatus.ERROR
+                is_blocked = status == ToolStatus.BLOCKED
             result_status = "error" if is_error else ("blocked" if is_blocked else "success")
 
             self._log_cycle(iteration, tool_call=name, result_status=result_status)
+            task_logger.record_tool_call(name, args, result_status)
 
             yield AgentEvent(
                 type="tool_result",
@@ -488,18 +841,59 @@ class Agent:
             )
 
             # ── Feed result back as role:"tool" ────────────────────
-            tool_call_id = f"call_{uuid.uuid4().hex[:12]}"
+            # The tool result carries a header naming the call it answers.
+            # The assistant turn cannot hold this: the model imitates whatever
+            # it sees in its own voice and emits the record instead of a real
+            # <tool_call>. Stated in the tool message, it is unambiguously an
+            # observation — and without it the model cannot tell which file or
+            # line range a result corresponds to, so it re-requests the data.
+            tool_call_id = f"call_{iteration}_{name}"
+            args_repr = json.dumps(args, ensure_ascii=False)
             self.history.append({
                 "role": "tool",
                 "tool_call_id": tool_call_id,
-                "content": result,
+                "content": f"Result of {name}({args_repr}):\n{result}",
             })
 
+            # ── Cap history to prevent context overflow ─────────────
+            self._cap_history()
+
         # ── Safety fallback: MAX_ITERATIONS reached ─────────────────
-        diag = (
-            f"Agent stopped after {MAX_ITERATIONS} iterations. "
-            f"Last tool called: {last_tool_name or 'none'}. "
-            f"Repeated calls detected: {'yes' if len(set(recent_signatures)) == 1 and len(recent_signatures) >= 2 else 'no'}."
+        # Yield a summary of what was accomplished, not an error
+        tools_used = list({s.split('"name": "')[1].split('"')[0]
+                          for s in recent_signatures if '"name": "' in s})
+        fallback = (
+            f"Stopped after {MAX_ITERATIONS} iterations without finishing. "
+            f"Tools used: {', '.join(tools_used) or 'none'}."
         )
+
+        # Actually ask the model what happened. The previous code yielded the
+        # instruction text itself to the user as if it were an answer.
+        self.history.append({
+            "role": "user",
+            "content": (
+                f"You've used all {MAX_ITERATIONS} tool-call iterations without "
+                "reaching a final answer. Stop calling tools. In 2-3 sentences, "
+                "tell the user what you found/attempted, what's still unresolved, "
+                "and what you'd need to finish (do NOT emit a <tool_call> block)."
+            ),
+        })
+        try:
+            safe_messages = self.context_manager.prepare_messages(self.history)
+            response = chat(safe_messages)
+            message = response.choices[0].message
+            summary = (message.content or "").strip()
+            if not summary:
+                summary = (getattr(message, "reasoning_content", None) or "").strip()
+            summary = re.sub(r"<tool_call>.*?</tool_call>", "", summary, flags=re.DOTALL).strip()
+            if not summary:
+                summary = fallback
+        except Exception:
+            summary = fallback
+
+        self.history.append({"role": "assistant", "content": summary})
         self._log_cycle(MAX_ITERATIONS, final=True)
-        yield AgentEvent(type="error", message=diag)
+        # had_error=True: hitting the cap is not a clean finish.
+        _finalize(summary, had_error=True)
+        yield AgentEvent(type="max_iterations_reached", message=summary)
+        return

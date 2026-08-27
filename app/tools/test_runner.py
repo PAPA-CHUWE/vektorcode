@@ -1,0 +1,1 @@
+def handler(**kwargs):\n    return {\"success\": True}\n

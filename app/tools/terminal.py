@@ -6,6 +6,8 @@ import re
 import subprocess
 
 from app.config import get_workspace
+from app.permissions.mode import DESTRUCTIVE, SHELL, request_approval
+from app.tools.tool_result import ToolResult
 
 DESTRUCTIVE_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\brm\s+(-[a-zA-Z]*r|-[a-zA-Z]*f|-[a-zA-Z]*rf)"),
@@ -34,12 +36,14 @@ def _is_destructive(command: str) -> bool:
 def run_command(
     command: str,
     working_directory: str = ".",
-    confirm: bool = False,
-) -> str:
+) -> "str | ToolResult":
     """Execute a command inside the workspace.
 
     Returns stdout, stderr, and exit code as a formatted string.
-    Blocks destructive commands unless confirm=True.
+
+    Approval is decided by the permission layer, which asks a human. There
+    is deliberately no ``confirm`` parameter: it used to be part of the
+    tool schema, so the model could grant itself permission to run ``rm``.
     """
     try:
         ws = get_workspace()
@@ -49,10 +53,13 @@ def run_command(
         if not cwd.exists():
             return f"Error: working directory does not exist: {working_directory}"
 
-        if _is_destructive(command) and not confirm:
-            return (
-                f"BLOCKED: This command looks destructive: {command}\n"
-                "Re-run with confirm=true to proceed."
+        kind = DESTRUCTIVE if _is_destructive(command) else SHELL
+        if not request_approval(kind, command):
+            noun = "destructive command" if kind == DESTRUCTIVE else "shell command"
+            # A real BLOCKED status, not a string the UI has to guess at —
+            # otherwise a refused command renders as a green success.
+            return ToolResult.blocked(
+                f"BLOCKED: {noun} not approved: {command}"
             )
 
         result = subprocess.run(
